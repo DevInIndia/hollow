@@ -1,0 +1,76 @@
+$ cat go.mod
+module github.com/DevInIndia/hollow
+
+go 1.25
+
+$ ls go.sum vendor
+ls: cannot access 'go.sum': No such file or directory
+ls: cannot access 'vendor': No such file or directory
+
+$ go list -deps ./... | grep -v '^github.com/DevInIndia/hollow'
+internal/goarch
+unsafe
+internal/abi
+internal/unsafeheader
+internal/cpu
+internal/bytealg
+internal/byteorder
+internal/chacha8rand
+internal/coverage/rtcov
+internal/godebugs
+internal/goexperiment
+internal/goos
+internal/profilerecord
+internal/runtime/atomic
+internal/runtime/math
+internal/runtime/strconv
+internal/runtime/syscall
+internal/runtime/cgroup
+internal/runtime/exithook
+internal/runtime/gc
+internal/asan
+internal/msan
+internal/race
+internal/runtime/sys
+internal/runtime/maps
+internal/stringslite
+internal/trace/tracev2
+runtime
+internal/reflectlite
+errors
+cmp
+internal/itoa
+iter
+math/bits
+math
+unicode/utf8
+strconv
+sync/atomic
+internal/sync
+internal/synctest
+sync
+unicode
+reflect
+slices
+internal/fmtsort
+io
+internal/oserror
+path
+internal/bisect
+internal/godebug
+syscall
+time
+io/fs
+internal/filepathlite
+internal/syscall/unix
+internal/poll
+internal/syscall/execenv
+internal/testlog
+os
+fmt
+
+$ go list -deps ./... | grep -v '^github.com/DevInIndia/hollow' | grep '^[^/]*\.'
+(no output above this line means zero third-party dependencies)
+
+$ go version
+go version go1.25.0 linux/amd64
