@@ -4,7 +4,15 @@
 # of this file is evidence a judge can rerun rather than take on faith.
 
 track = "C"
-pitch = "A DNS resolver and wire-format toolkit that speaks the protocol from raw octets, with an empty go.mod and no third-party code."
+pitch = "A recursive DNS resolver that walks from the root servers and speaks the protocol from raw octets, with an empty go.mod and no third-party code."
+
+# Claimed bonuses, each backed by something a judge can rerun. Single File is
+# not attempted. See the Submission Notes in README.md.
+[bonuses]
+reproducible_build = true # make reproduce, and make verify gates the published hash
+stdlib_log = true         # STDLIB.md, 21 substitutions against a required 10
+package_killer = true     # internal/wire replaces github.com/miekg/dns
+single_file = false
 
 [project]
 name = "hollow"

@@ -71,11 +71,14 @@ fmt
 context
 strings
 encoding/hex
+bytes
 encoding
+encoding/base64
+unicode/utf16
+encoding/json
 flag
 hash
 crypto
-bytes
 crypto/internal/fips140deps/godebug
 crypto/internal/fips140
 crypto/internal/fips140/alias
@@ -111,6 +114,7 @@ vendor/golang.org/x/net/dns/dnsmessage
 internal/nettrace
 internal/singleflight
 net
+bufio
 os/signal
 text/tabwriter
 
