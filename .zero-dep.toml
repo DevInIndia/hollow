@@ -1,0 +1,30 @@
+# Zero Dependency hackathon submission manifest.
+#
+# The requirement on record is the track letter and a one-line pitch. The rest
+# of this file is evidence a judge can rerun rather than take on faith.
+
+track = "C"
+pitch = "A DNS resolver and wire-format toolkit that speaks the protocol from raw octets, with an empty go.mod and no third-party code."
+
+[project]
+name = "hollow"
+repository = "https://github.com/DevInIndia/hollow"
+license = "MIT"
+language = "Go"
+go_version = "1.25"
+
+[dependencies]
+count = 0
+require_block = false
+go_sum = false
+vendor_dir = false
+proof = "deps-proof.txt"
+
+[verification]
+build = "go build ./cmd/hollow"
+verify = "make verify"
+reproduce = "make reproduce"
+
+# Build hashes are published in README.md rather than duplicated here. They
+# change with every commit that touches cmd/hollow or anything it imports, and
+# two copies of a value that goes stale is one copy too many.

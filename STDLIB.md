@@ -1,0 +1,36 @@
+# Standard Library Substitutions
+
+Packages a conventional Go implementation of this project would install, and
+what `hollow` uses instead. The trade-off column says what each substitution
+cost, in the terms it actually cost them: lines written, bugs shipped,
+constraints discovered. An entry that only restates the substitution is not
+worth reading.
+
+Counts below are current: 2,018 lines of non-test code and 2,542 lines of test.
+
+| Third-party package | Standard library used instead | What it cost |
+|---|---|---|
+| `github.com/miekg/dns` | `encoding/binary`, `net/netip`, hand-written codec in `internal/wire` | 1,232 lines of codec and 1,725 lines of test to reach the starting line miekg gives you for free. Two name-compression bugs shipped before the fuzz target caught them: keys that folded case, then keys that joined labels with a dot, which collided the one-label name `a.b` with the two-label pair `a`,`b` and made the encoder silently rewrite the second name into the first. Both were reachable from the network. |
+| `github.com/spf13/cobra`, `urfave/cli`, `spf13/pflag` | `flag` and a verb switch in `cmd/hollow` | No shell completion, no nested subcommands, and the usage text is written by hand. `flag.ContinueOnError` with an explicit `SetOutput` was needed so a bad flag returns an exit code instead of calling `os.Exit`, which is the only reason the resolve verb is testable at all. |
+| `github.com/stretchr/testify` | `testing`, `reflect.DeepEqual` | 2,542 lines of test for 2,018 lines of code, every assertion spelled out as an `if` and an `Errorf`. It pays back in the fuzz target, where the round-trip check is one `DeepEqual` on two decoded messages and a failure prints both messages rather than a helper's rendering of them. |
+| `github.com/davecgh/go-spew` | `fmt` with `%+v` and `% x` | Comparing two 509-octet messages by eye during the compression bug, with no structural diff to lean on. `% x` on the encoder's buffer is what exposed the `c0 0c` pointer that should not have been there. |
+| `github.com/olekukonko/tablewriter` | `text/tabwriter` | `tabwriter` aligns only runs of lines with the same cell count, so the dig-style output had to be ordered so that comment lines break the runs deliberately, and the padding was chosen by looking at real output rather than configured. |
+| `github.com/google/uuid`, `math/rand` seeding for query IDs | `crypto/rand` | Almost nothing: `crypto/rand.Read` cannot fail as of Go 1.24, so a transaction ID is three lines. What it exposed is that the ID is only half the defence against a forged answer. The other half is the source port, which is why the UDP socket is dialled rather than opened with `ListenPacket`, so the kernel drops datagrams from any other address before this process sees them. |
+| `net.IP` as a map key | `net/netip.Addr` | `net.IP` is a byte slice, slices are not comparable, and it therefore cannot be a map key without stringifying it first. `netip.Addr` is comparable and brings RFC 5952 IPv6 formatting along. The cost is cosmetic and real: it pulls `unique` and `weak` into `deps-proof.txt`, both of which read like third-party packages at a glance. |
+| `vendor/golang.org/x/net/dns/dnsmessage` | `internal/wire` | This is the DNS parser the Go team vendored into the standard library for `net`'s own resolver, and it is not importable: the `vendor/` prefix scopes it to the toolchain. Writing our own was not a choice about dependencies, it was the only route. The path still appears in `deps-proof.txt` because `net` imports it, which is why that file spends a paragraph saying so. |
+| `github.com/pkg/errors` | `errors`, `fmt.Errorf` with `%w` | No stack traces on a failed decode. Bought in exchange: eight typed sentinels that `errors.Is` matches, which is what lets the fuzz target assert that every rejection is a failure class the package names rather than a bare string it cannot act on. |
+| `github.com/json-iterator/go`, `mailru/easyjson` | `encoding/json` | The wire types cannot be marshalled directly. `RData` is an interface with an unexported method, so `--json` needed a parallel set of view structs, about 45 lines in `internal/cli`. The upside was not planned: the JSON shape is now a deliberate contract instead of whatever the wire structs happen to look like this week. |
+| `github.com/google/go-cmp` | `reflect.DeepEqual` | No diff on failure, so a round-trip mismatch prints two whole messages and the reader finds the differing field. Acceptable because it fires rarely. The one time it did fire, it pointed straight at a rewritten name. |
+| `github.com/dvyukov/go-fuzz` | `testing.F` | Nothing. Native fuzzing needs no build tag, no separate corpus repository and no second toolchain. 38.4 million executions clean, and it found the compression key collision that code review and twenty hand-written malformed cases had both missed. |
+| `github.com/cenkalti/backoff`, retry wrappers generally | `context.WithTimeout`, `net.Conn` deadlines | A race that took a `-count` run to surface. The context's timer and the socket deadline derived from it fire at the same instant, so a read can report a timeout a moment before `ctx.Err()` admits the context is done. Deciding which happened from the socket's error rather than from `ctx.Err()` is not obvious until it flakes. |
+| `github.com/golang/mock`, `testify/mock` | Real loopback listeners in the tests | The test server has to hold the same port on UDP and TCP, which the kernel will not promise, so it binds UDP first and retries the pair on collision. Worth it: truncation and the TCP fallback run over real sockets, and it caught that closing a TCP socket holding unread data sends a reset rather than a FIN. |
+| cgo and the libc resolver | `CGO_ENABLED=0` and Go's pure-Go resolver | `go test -race` still needs cgo, so `CGO_ENABLED=0` cannot be hoisted out of the Makefile and has to be set on each command. It also caught a defect in our own evidence: `deps-proof.txt` had been generated with cgo on and listed `runtime/cgo` for a binary nobody ships that way. |
+| `GOTOOLCHAIN=auto`, the dependency nobody notices they have | `GOTOOLCHAIN=local` | One Makefile line, plus a caveat that has to be documented because the pin covers `make` and not a judge running `go build ./cmd/hollow` directly. Verified rather than assumed: with `go 1.99` in `go.mod`, `auto` attempts a download from `proxy.golang.org` in the middle of the build and `local` refuses. A network fetch during a build that claims to need no network. |
+| `github.com/spf13/viper`, `mitchellh/go-homedir` | `flag` with relative defaults | No config file, so every setting is a flag and there is nowhere to keep a long-lived preference. Deliberate rather than reluctant: no hardcoded `/etc` or `/var` path is one of the reasons the same source builds and behaves the same on Windows. |
+
+## What is not here
+
+Entries are written when they are earned, not assembled at the end. Colour
+output, structured logging, `errors.Join` over failed nameservers and an LRU
+cache all have obvious standard library answers, and none of them are in this
+table because none of that code exists yet.
