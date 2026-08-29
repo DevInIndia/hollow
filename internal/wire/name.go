@@ -277,11 +277,21 @@ func (e *encoder) encodeName(n Name, compress bool) error {
 	return nil
 }
 
+// suffixKey identifies a name suffix by the octets it encodes to, length
+// prefixes included.
+//
+// The prefixes are what make the key unambiguous, and joining the labels with a
+// separator instead does not: a label may itself contain the separator octet,
+// so the single label "a.b" and the pair "a", "b" would share a key while being
+// different names. The encoder would then point the second at the first and
+// silently rewrite it. Keying on the wire octets makes two suffixes collide
+// exactly when a pointer between them is correct, which is the property being
+// relied on when one name is replaced by the offset of another.
 func suffixKey(labels [][]byte) string {
 	var b strings.Builder
 	for _, l := range labels {
+		b.WriteByte(byte(len(l)))
 		b.Write(l)
-		b.WriteByte('.')
 	}
 	return b.String()
 }

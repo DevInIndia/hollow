@@ -289,3 +289,37 @@ func TestNameCompressionIsCaseSensitive(t *testing.T) {
 		t.Errorf("second name = %q, want ExAmPlE.cOm.", second)
 	}
 }
+
+// The same property as above reached through label boundaries rather than case.
+// A label may hold a '.' octet, so the one-label name "a.b" and the two-label
+// name "a" "b" are different names that a separator-joined compression key
+// cannot tell apart. Found by FuzzUnpack's round-trip property.
+func TestNameCompressionRespectsLabelBoundaries(t *testing.T) {
+	// Escaped in presentation form, so these are one label and two labels.
+	const (
+		oneLabel Name = "a\\.b."
+		twoLabel Name = "a.b."
+	)
+
+	for _, order := range [][2]Name{{twoLabel, oneLabel}, {oneLabel, twoLabel}} {
+		t.Run(string(order[0])+" then "+string(order[1]), func(t *testing.T) {
+			e := &encoder{ptrs: map[string]int{}}
+			for _, n := range order {
+				if err := e.name(n); err != nil {
+					t.Fatalf("encode(%q) = %v", n, err)
+				}
+			}
+			// The first name occupies offset 0 and is 5 octets either way.
+			if bytes.Contains(e.buf[5:], []byte{0xC0}) {
+				t.Fatalf("second name was compressed against the first: % x", e.buf)
+			}
+			got, _, err := decodeNameAt(t, e.buf, 5)
+			if err != nil {
+				t.Fatalf("decode = %v", err)
+			}
+			if got != order[1] {
+				t.Errorf("second name = %q, want %q", got, order[1])
+			}
+		})
+	}
+}
