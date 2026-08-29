@@ -17,7 +17,15 @@ REPRO   := -trimpath -buildvcs=false -ldflags='$(LDFLAGS)'
 .ONESHELL:
 .SHELLFLAGS := -ec
 
-.PHONY: build test verify deps-proof reproduce
+# The environment the SHA-256 published in README.md belongs to. A reproducible
+# build is reproducible for one platform and one toolchain, not universally, so
+# the hash check runs only where the published value can be right and says why
+# it stood aside anywhere else.
+HASH_GOOS      := linux
+HASH_GOARCH    := amd64
+HASH_TOOLCHAIN := go1.25.0
+
+.PHONY: build test verify hash-check deps-proof reproduce
 
 build:
 	CGO_ENABLED=0 go build $(REPRO) -o $(BINARY) $(PKG)
@@ -44,7 +52,42 @@ verify:
 		set -- $$t
 		CGO_ENABLED=0 GOOS=$$1 GOARCH=$$2 go build ./...
 	done
+	$(MAKE) --no-print-directory hash-check
 	echo "VERIFY: all checks passed"
+
+# Keeping the published hash current was a discipline problem, which means it was
+# going to go stale between the commit that changed the binary and the commit
+# that noticed. The dependency claim is a gate rather than a promise, and this is
+# the same claim about the same artifact, so it gets the same treatment.
+hash-check:
+	here="$$(go env GOOS)/$$(go env GOARCH) $$(go env GOVERSION)"
+	want="$(HASH_GOOS)/$(HASH_GOARCH) $(HASH_TOOLCHAIN)"
+	if [ "$$here" != "$$want" ]; then
+		echo "HASH: skipped, README publishes $$want and this is $$here"
+		exit 0
+	fi
+
+	# Read the hash rather than trusting a copy of it: the README is the
+	# published artifact, so it is the README that has to be right.
+	published=$$(grep -oE '\b[0-9a-f]{64}\b' README.md | head -n 1)
+	if [ -z "$$published" ]; then
+		echo "HASH: README.md publishes no SHA-256" >&2
+		exit 1
+	fi
+
+	mkdir -p build
+	CGO_ENABLED=0 go build $(REPRO) -o build/$(BINARY).hash $(PKG)
+	actual=$$(sha256sum build/$(BINARY).hash | cut -d' ' -f1)
+	rm -rf build
+
+	if [ "$$published" != "$$actual" ]; then
+		echo "HASH: README.md is stale." >&2
+		echo "  published $$published" >&2
+		echo "  actual    $$actual" >&2
+		echo "  Update the SHA-256 in README.md before committing." >&2
+		exit 1
+	fi
+	echo "HASH: README.md matches the build ($$actual)"
 
 # Records the commands as well as their output so a judge can rerun them.
 # A standard library import path never has a dot in its first element, so
