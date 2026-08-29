@@ -281,3 +281,36 @@ func TestUnknownTypeRoundTrips(t *testing.T) {
 		t.Errorf("Type.String() = %q, want TYPE257", rr.Type.String())
 	}
 }
+
+// ParseType is the inverse of Type.String, and the property worth pinning is
+// that round trip: a type this package does not model has to survive being
+// printed and read back, or a caller cannot ask for the record they were just
+// shown.
+func TestParseTypeRoundTrip(t *testing.T) {
+	known := []Type{TypeA, TypeNS, TypeCNAME, TypeSOA, TypePTR, TypeMX, TypeTXT, TypeAAAA, TypeSRV, TypeOPT, TypeANY}
+	for _, want := range append(known, 0, 99, 65535) {
+		got, err := ParseType(want.String())
+		if err != nil {
+			t.Errorf("ParseType(%q) = %v", want.String(), err)
+			continue
+		}
+		if got != want {
+			t.Errorf("ParseType(%q) = %d, want %d", want.String(), got, want)
+		}
+	}
+}
+
+func TestParseTypeSpelling(t *testing.T) {
+	// Zone files and dig both accept either case, and refusing "aaaa" would be
+	// a difference from every other tool for no reason.
+	for _, s := range []string{"aaaa", "AAAA", "AaAa", "type28", "TYPE28"} {
+		if got, err := ParseType(s); err != nil || got != TypeAAAA {
+			t.Errorf("ParseType(%q) = %d, %v, want %d, nil", s, got, err, TypeAAAA)
+		}
+	}
+	for _, s := range []string{"", "NOTATYPE", "TYPE", "TYPE65536", "TYPE-1", "TYPE 1", "TYPEA"} {
+		if got, err := ParseType(s); err == nil {
+			t.Errorf("ParseType(%q) = %d, nil, want an error", s, got)
+		}
+	}
+}

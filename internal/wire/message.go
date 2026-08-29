@@ -11,6 +11,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 )
 
 const headerLen = 12
@@ -75,6 +77,42 @@ func (t Type) String() string {
 		return "ANY"
 	}
 	return fmt.Sprintf("TYPE%d", uint16(t))
+}
+
+// ParseType is the inverse of Type.String. It accepts the mnemonics above,
+// case-insensitively, and the RFC 3597 "TYPE65535" form for everything else, so
+// a type this package does not model can still be asked for by number.
+func ParseType(s string) (Type, error) {
+	switch strings.ToUpper(s) {
+	case "A":
+		return TypeA, nil
+	case "NS":
+		return TypeNS, nil
+	case "CNAME":
+		return TypeCNAME, nil
+	case "SOA":
+		return TypeSOA, nil
+	case "PTR":
+		return TypePTR, nil
+	case "MX":
+		return TypeMX, nil
+	case "TXT":
+		return TypeTXT, nil
+	case "AAAA":
+		return TypeAAAA, nil
+	case "SRV":
+		return TypeSRV, nil
+	case "OPT":
+		return TypeOPT, nil
+	case "ANY":
+		return TypeANY, nil
+	}
+	if rest, ok := strings.CutPrefix(strings.ToUpper(s), "TYPE"); ok {
+		if n, err := strconv.ParseUint(rest, 10, 16); err == nil {
+			return Type(n), nil
+		}
+	}
+	return 0, fmt.Errorf("wire: unknown record type %q", s)
 }
 
 // Class is a DNS class code.
