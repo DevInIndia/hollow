@@ -12,8 +12,13 @@ import (
 	"github.com/DevInIndia/hollow/internal/wire"
 )
 
-// iterate resolves a question from the root, with no upstream resolver.
-func iterate(ctx context.Context, tr resolver.Transport, q wire.Question, hintsPath string, port uint16, trace func(resolver.Step)) (*resolver.Result, error) {
+// newResolver builds a resolver starting from the compiled-in root servers, or
+// from a named.root file when one is given.
+//
+// A hints file that cannot be read is an error rather than a reason to fall back
+// to the built-in list. Someone who names a file and gets the defaults has been
+// told their private root works when it was never consulted.
+func newResolver(tr resolver.Transport, hintsPath string, port uint16, trace func(resolver.Step)) (*resolver.Resolver, error) {
 	servers := roothints.Builtin()
 	if hintsPath != "" {
 		f, err := os.Open(hintsPath)
@@ -25,11 +30,19 @@ func iterate(ctx context.Context, tr resolver.Transport, q wire.Question, hintsP
 			return nil, err
 		}
 	}
-	r := &resolver.Resolver{
+	return &resolver.Resolver{
 		Transport: tr,
 		Hints:     roothints.Addrs(servers, port),
 		Port:      port,
 		Trace:     trace,
+	}, nil
+}
+
+// iterate resolves a question from the root, with no upstream resolver.
+func iterate(ctx context.Context, tr resolver.Transport, q wire.Question, hintsPath string, port uint16, trace func(resolver.Step)) (*resolver.Result, error) {
+	r, err := newResolver(tr, hintsPath, port, trace)
+	if err != nil {
+		return nil, err
 	}
 	return r.Resolve(ctx, q)
 }

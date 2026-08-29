@@ -22,8 +22,7 @@ func main() {
 	case "resolve":
 		os.Exit(cli.Resolve(os.Args[2:], os.Stdout, os.Stderr))
 	case "serve":
-		fmt.Fprintf(os.Stderr, "hollow: %s is not implemented yet\n", verb)
-		os.Exit(cli.ExitFailure)
+		os.Exit(cli.Serve(os.Args[2:], os.Stdout, os.Stderr))
 	default:
 		fmt.Fprintf(os.Stderr, "hollow: unknown command %q\n", verb)
 		usage(os.Stderr)
@@ -37,7 +36,7 @@ func usage(w io.Writer) {
 usage:
 
 	hollow resolve <name> [type]   resolve a name from the root servers
-	hollow serve                   run a caching DNS server (not implemented)
+	hollow serve                   answer DNS on 127.0.0.1:15353, udp and tcp
 
 Run "hollow <command> -h" for the flags a command accepts.
 `)
