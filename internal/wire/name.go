@@ -34,6 +34,37 @@ func (n Name) EqualFold(other Name) bool {
 	return strings.EqualFold(string(n), string(other))
 }
 
+// Within reports whether n lies inside zone, either equal to it or below it.
+// Every name is within the root.
+//
+// This compares labels, not bytes, and the difference is a security one. A
+// label may contain a dot, escaped as "\." in presentation form, so a suffix
+// test over the string would read the single label "evil\.com" as ending in the
+// label "com" and place it inside the com zone. That is exactly the input a
+// bailiwick check exists to reject, so the slower comparison is the only correct
+// one. A name that does not parse is within nothing, which keeps the failure
+// closed rather than open.
+func (n Name) Within(zone Name) bool {
+	zl, err := zone.labels()
+	if err != nil {
+		return false
+	}
+	if len(zl) == 0 {
+		return true // the root contains everything
+	}
+	nl, err := n.labels()
+	if err != nil || len(nl) < len(zl) {
+		return false
+	}
+	for i := range zl {
+		// RFC 4343: labels match without regard to case.
+		if !strings.EqualFold(string(nl[len(nl)-len(zl)+i]), string(zl[i])) {
+			return false
+		}
+	}
+	return true
+}
+
 // ParseName converts a presentation-format name to a Name, accepting both
 // "example.com" and "example.com." and canonicalising to the latter.
 func ParseName(s string) (Name, error) {

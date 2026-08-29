@@ -323,3 +323,45 @@ func TestNameCompressionRespectsLabelBoundaries(t *testing.T) {
 		})
 	}
 }
+
+func TestWithin(t *testing.T) {
+	for _, tc := range []struct {
+		name, zone Name
+		want       bool
+	}{
+		{"example.com.", "com.", true},
+		{"www.example.com.", "com.", true},
+		{"example.com.", "example.com.", true}, // a zone is within itself
+		{"com.", "example.com.", false},        // the parent is not within the child
+		{"example.org.", "com.", false},
+		{"notexample.com.", "example.com.", false}, // a label boundary, not a substring
+		{"anything.", ".", true},                   // everything is within the root
+		{".", ".", true},
+		{"EXAMPLE.CoM.", "example.com.", true}, // RFC 4343
+		{"www.EXAMPLE.com.", "ExAmPlE.CoM.", true},
+
+		// The reason this compares labels. "evil\.com" is one label whose text
+		// happens to contain a dot, so it is a sibling of com, not a child of
+		// it. A string suffix test reads it as ending in ".com." and admits it.
+		{`evil\.com.`, "com.", false},
+		{`ns1.evil\.com.`, "com.", false},
+		{`ns1.evil\.com.`, `evil\.com.`, true},
+	} {
+		t.Run(string(tc.name)+" in "+string(tc.zone), func(t *testing.T) {
+			if got := tc.name.Within(tc.zone); got != tc.want {
+				t.Errorf("Name(%q).Within(%q) = %v, want %v", tc.name, tc.zone, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWithinRejectsUnparsableNames(t *testing.T) {
+	// A name that cannot be split is within nothing. A bailiwick check that
+	// failed open on malformed input would be worse than not having one.
+	if Name(`bad\`).Within("com.") {
+		t.Error("an unparsable name was reported as within a zone")
+	}
+	if Name("example.com.").Within(`bad\`) {
+		t.Error("a name was reported as within an unparsable zone")
+	}
+}
