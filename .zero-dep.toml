@@ -10,7 +10,7 @@ pitch = "A recursive DNS resolver that walks from the root servers and speaks th
 # not attempted. See the Submission Notes in README.md.
 [bonuses]
 reproducible_build = true # make reproduce, and make verify gates the published hash
-stdlib_log = true         # STDLIB.md, 21 substitutions against a required 10
+stdlib_log = true         # STDLIB.md, 27 substitutions against a required 10
 package_killer = true     # internal/wire replaces github.com/miekg/dns
 single_file = false
 

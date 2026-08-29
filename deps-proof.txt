@@ -115,6 +115,11 @@ internal/nettrace
 internal/singleflight
 net
 bufio
+log/internal
+log
+log/slog/internal
+log/slog/internal/buffer
+log/slog
 os/signal
 text/tabwriter
 
