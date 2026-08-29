@@ -26,6 +26,7 @@ var (
 	ErrNameSyntax     = errors.New("wire: malformed name")
 	ErrBadPointer     = errors.New("wire: compression pointer does not point strictly backwards")
 	ErrTooManyRecords = errors.New("wire: section exceeds 65535 records")
+	ErrRData          = errors.New("wire: malformed rdata")
 )
 
 // Type is a DNS resource record type code.
@@ -154,18 +155,19 @@ type Question struct {
 	Class Class
 }
 
-// RR is a resource record with its RDATA left opaque. Per-type interpretation
-// lives in rdata.go, so an unknown type still round-trips.
+// RR is a resource record. The rdata is parsed into a per-type value from
+// rdata.go, and a type this package does not model keeps its octets as Unknown,
+// so an unfamiliar record still round-trips.
 //
-// RData aliases the message buffer it was decoded from. Callers that keep an RR
-// beyond the lifetime of that buffer, notably anything caching or pooling, must
-// copy it first.
+// Type is kept alongside Data rather than derived from it, so that reading the
+// type of a record never depends on the rdata being present. Pack rejects a
+// record whose two disagree.
 type RR struct {
 	Name  Name
 	Type  Type
 	Class Class
 	TTL   int32
-	RData []byte
+	Data  RData
 }
 
 // Message is a decoded DNS message.
@@ -200,6 +202,48 @@ func (d *decoder) uint32() (uint32, error) {
 	v := binary.BigEndian.Uint32(d.msg[d.off:])
 	d.off += 4
 	return v, nil
+}
+
+func (d *decoder) uint8() (uint8, error) {
+	if d.off >= len(d.msg) {
+		return 0, fmt.Errorf("uint8 at offset %d: %w", d.off, ErrTruncated)
+	}
+	v := d.msg[d.off]
+	d.off++
+	return v, nil
+}
+
+// bytes returns the next n octets, aliasing the message buffer.
+func (d *decoder) bytes(n int) ([]byte, error) {
+	if n < 0 || d.off+n > len(d.msg) {
+		return nil, fmt.Errorf("%d octets at offset %d, %d present: %w",
+			n, d.off, len(d.msg)-d.off, ErrTruncated)
+	}
+	b := d.msg[d.off : d.off+n]
+	d.off += n
+	return b, nil
+}
+
+// remaining reports the octets left before the decoder's end. Inside an rdata
+// field that end is the RDLENGTH boundary, not the end of the message.
+func (d *decoder) remaining() int { return len(d.msg) - d.off }
+
+// rest consumes and returns everything left, aliasing the message buffer.
+func (d *decoder) rest() []byte {
+	b := d.msg[d.off:]
+	d.off = len(d.msg)
+	return b
+}
+
+// address reads an address of exactly n octets. The width is fixed by the
+// record type, so any other length is malformed even when RDLENGTH agrees with
+// the octets present.
+func (d *decoder) address(n int) ([]byte, error) {
+	if d.remaining() != n {
+		return nil, fmt.Errorf("address rdata is %d octets, want %d: %w",
+			d.remaining(), n, ErrRData)
+	}
+	return d.bytes(n)
 }
 
 func (d *decoder) question() (Question, error) {
@@ -243,14 +287,32 @@ func (d *decoder) rr() (RR, error) {
 		return RR{}, fmt.Errorf("rdlength %d at offset %d exceeds %d remaining: %w",
 			rdlen, d.off, len(d.msg)-d.off, ErrTruncated)
 	}
-	rdata := d.msg[d.off : d.off+int(rdlen)]
-	d.off += int(rdlen)
+	end := d.off + int(rdlen)
+
+	// The rdata is parsed by a decoder holding the same buffer cut off at the
+	// RDLENGTH boundary. Names inside rdata may be compressed, so the parser
+	// needs the whole message to follow a pointer backwards, while every
+	// forward read has to stop at the end of this field.
+	rd := &decoder{msg: d.msg[:end], off: d.off}
+	data, err := decodeRData(rd, Type(typ))
+	if err != nil {
+		return RR{}, fmt.Errorf("%v rdata at offset %d: %w", Type(typ), d.off, err)
+	}
+	// Landing anywhere but exactly on the boundary means RDLENGTH and the
+	// rdata disagree, which is the signature of a whole class of malformed
+	// message and is never a record worth keeping.
+	if rd.off != end {
+		return RR{}, fmt.Errorf("%v rdata at offset %d consumed %d of %d octets: %w",
+			Type(typ), d.off, rd.off-d.off, rdlen, ErrRData)
+	}
+	d.off = end
+
 	return RR{
 		Name:  name,
 		Type:  Type(typ),
 		Class: Class(class),
 		TTL:   int32(ttl),
-		RData: rdata,
+		Data:  data,
 	}, nil
 }
 
@@ -321,17 +383,33 @@ func (e *encoder) question(q Question) error {
 }
 
 func (e *encoder) rr(rr RR) error {
+	if rr.Data == nil {
+		return fmt.Errorf("%v record %q has no rdata: %w", rr.Type, rr.Name, ErrRData)
+	}
+	if got := rr.Data.Type(); got != rr.Type {
+		return fmt.Errorf("%v record %q carries %v rdata: %w", rr.Type, rr.Name, got, ErrRData)
+	}
 	if err := e.name(rr.Name); err != nil {
 		return err
 	}
 	e.buf = binary.BigEndian.AppendUint16(e.buf, uint16(rr.Type))
 	e.buf = binary.BigEndian.AppendUint16(e.buf, uint16(rr.Class))
 	e.buf = binary.BigEndian.AppendUint32(e.buf, uint32(rr.TTL))
-	if len(rr.RData) > 0xFFFF {
-		return fmt.Errorf("rdata is %d octets: %w", len(rr.RData), ErrTooManyRecords)
+
+	// RDLENGTH is not known until the rdata has been written, because a name
+	// inside it compresses against whatever precedes it. Reserve the field and
+	// fill it in once the length is a fact.
+	lenAt := len(e.buf)
+	e.buf = append(e.buf, 0, 0)
+	start := len(e.buf)
+	if err := rr.Data.pack(e); err != nil {
+		return err
 	}
-	e.buf = binary.BigEndian.AppendUint16(e.buf, uint16(len(rr.RData)))
-	e.buf = append(e.buf, rr.RData...)
+	n := len(e.buf) - start
+	if n > 0xFFFF {
+		return fmt.Errorf("rdata is %d octets: %w", n, ErrTooManyRecords)
+	}
+	binary.BigEndian.PutUint16(e.buf[lenAt:], uint16(n))
 	return nil
 }
 

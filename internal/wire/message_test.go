@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net/netip"
 	"testing"
 )
 
@@ -100,11 +101,11 @@ func TestMessageCompressesAcrossRecords(t *testing.T) {
 		Header:    Header{ID: 1, Response: true},
 		Questions: []Question{{Name: "example.com.", Type: TypeA, Class: ClassIN}},
 		Answers: []RR{
-			{Name: "example.com.", Type: TypeA, Class: ClassIN, TTL: 300, RData: []byte{93, 184, 216, 34}},
-			{Name: "www.example.com.", Type: TypeA, Class: ClassIN, TTL: 300, RData: []byte{1, 2, 3, 4}},
+			{Name: "example.com.", Type: TypeA, Class: ClassIN, TTL: 300, Data: A{Addr: netip.AddrFrom4([4]byte{93, 184, 216, 34})}},
+			{Name: "www.example.com.", Type: TypeA, Class: ClassIN, TTL: 300, Data: A{Addr: netip.AddrFrom4([4]byte{1, 2, 3, 4})}},
 		},
 		Authority: []RR{
-			{Name: "example.com.", Type: TypeNS, Class: ClassIN, TTL: 300, RData: []byte{0}},
+			{Name: "example.com.", Type: TypeNS, Class: ClassIN, TTL: 300, Data: NS{Host: Root}},
 		},
 	}
 
@@ -130,8 +131,8 @@ func TestMessageCompressesAcrossRecords(t *testing.T) {
 			t.Errorf("name %d = %q, want %q", i, names[i], want[i])
 		}
 	}
-	if !bytes.Equal(back.Answers[0].RData, []byte{93, 184, 216, 34}) {
-		t.Errorf("rdata = % x, want 5d b8 d8 22", back.Answers[0].RData)
+	if got, want := back.Answers[0].Data, (A{Addr: netip.AddrFrom4([4]byte{93, 184, 216, 34})}); got != want {
+		t.Errorf("rdata = %v, want %v", got, want)
 	}
 
 	again, err := back.Pack()
@@ -194,18 +195,22 @@ func TestUnpackRejects(t *testing.T) {
 
 // 512 octets is the pre-EDNS0 UDP limit, so it is the boundary most likely to
 // be special-cased by accident. Nothing here should treat it as one.
+//
+// The payload is an unmodelled type, whose rdata is a plain octet run and so
+// can be sized to land the message exactly on each boundary.
 func TestMessageAtUDPSizeBoundary(t *testing.T) {
+	const typeFiller Type = 65280
 	for _, size := range []int{511, 512, 513} {
 		t.Run(fmt.Sprint(size), func(t *testing.T) {
 			// Header 12 + question 17 + record overhead 12 leaves the rest
-			// of the message to opaque rdata.
+			// of the message to rdata.
 			const overhead = 12 + 17 + 12
 			m := &Message{
 				Header:    Header{ID: 9, Response: true},
-				Questions: []Question{{Name: "example.com.", Type: TypeTXT, Class: ClassIN}},
+				Questions: []Question{{Name: "example.com.", Type: typeFiller, Class: ClassIN}},
 				Answers: []RR{{
-					Name: "example.com.", Type: TypeTXT, Class: ClassIN, TTL: 60,
-					RData: bytes.Repeat([]byte{'x'}, size-overhead),
+					Name: "example.com.", Type: typeFiller, Class: ClassIN, TTL: 60,
+					Data: Unknown{Kind: typeFiller, Data: bytes.Repeat([]byte{'x'}, size-overhead)},
 				}},
 			}
 			buf, err := m.Pack()
@@ -219,7 +224,11 @@ func TestMessageAtUDPSizeBoundary(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Unpack() = %v", err)
 			}
-			if got := len(back.Answers[0].RData); got != size-overhead {
+			u, ok := back.Answers[0].Data.(Unknown)
+			if !ok {
+				t.Fatalf("rdata is %T, want Unknown", back.Answers[0].Data)
+			}
+			if got := len(u.Data); got != size-overhead {
 				t.Errorf("rdata = %d octets, want %d", got, size-overhead)
 			}
 		})
@@ -243,8 +252,11 @@ func TestUnknownTypeRoundTrips(t *testing.T) {
 	const typeCAA Type = 257
 	rdata := []byte{0, 5, 'i', 's', 's', 'u', 'e'}
 	m := &Message{
-		Header:  Header{ID: 7, Response: true},
-		Answers: []RR{{Name: "example.com.", Type: typeCAA, Class: ClassIN, TTL: 60, RData: rdata}},
+		Header: Header{ID: 7, Response: true},
+		Answers: []RR{{
+			Name: "example.com.", Type: typeCAA, Class: ClassIN, TTL: 60,
+			Data: Unknown{Kind: typeCAA, Data: rdata},
+		}},
 	}
 	buf, err := m.Pack()
 	if err != nil {
@@ -258,8 +270,12 @@ func TestUnknownTypeRoundTrips(t *testing.T) {
 	if rr.Type != typeCAA {
 		t.Errorf("type = %v, want %v", rr.Type, typeCAA)
 	}
-	if !bytes.Equal(rr.RData, rdata) {
-		t.Errorf("rdata = % x, want % x", rr.RData, rdata)
+	u, ok := rr.Data.(Unknown)
+	if !ok {
+		t.Fatalf("rdata is %T, want Unknown", rr.Data)
+	}
+	if !bytes.Equal(u.Data, rdata) {
+		t.Errorf("rdata = % x, want % x", u.Data, rdata)
 	}
 	if rr.Type.String() != "TYPE257" {
 		t.Errorf("Type.String() = %q, want TYPE257", rr.Type.String())

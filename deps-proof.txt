@@ -68,6 +68,11 @@ internal/syscall/execenv
 internal/testlog
 os
 fmt
+encoding/binary
+weak
+unique
+net/netip
+strings
 
 $ go list -deps ./... | grep -v '^github.com/DevInIndia/hollow' | grep '^[^/]*\.'
 (no output above this line means zero third-party dependencies)

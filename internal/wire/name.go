@@ -231,7 +231,20 @@ func (d *decoder) name() (Name, error) {
 // pointer replaces the name with whatever bytes sit at the target, so matching
 // two spellings that differ in case would silently rewrite the case of the name
 // being encoded, which is precisely what the 0x20 defence must not allow.
-func (e *encoder) name(n Name) error {
+func (e *encoder) name(n Name) error { return e.encodeName(n, true) }
+
+// nameUncompressed writes a name without pointing at an earlier copy of it, and
+// without offering it as a target for a later one.
+//
+// RFC 2782 forbids compressing an SRV target, and RFC 3597 extends that to the
+// rdata of every type defined after RFC 1035. The reason is the receiver, not
+// the sender: anything that treats such rdata as opaque octets never expands a
+// pointer inside it, so a compressed name reaches the far side corrupt. Not
+// recording the offset matters for the same reason, since a pointer from
+// elsewhere in the message into this name would be equally unreadable.
+func (e *encoder) nameUncompressed(n Name) error { return e.encodeName(n, false) }
+
+func (e *encoder) encodeName(n Name, compress bool) error {
 	labels, err := n.labels()
 	if err != nil {
 		return err
@@ -245,15 +258,17 @@ func (e *encoder) name(n Name) error {
 	}
 
 	for i, l := range labels {
-		suffix := suffixKey(labels[i:])
-		if off, ok := e.ptrs[suffix]; ok {
-			e.buf = append(e.buf, byte(0xC0|off>>8), byte(off))
-			return nil
-		}
-		// Offsets above 14 bits cannot be expressed as a pointer, so they are
-		// never recorded as compression targets.
-		if len(e.buf) <= 0x3FFF {
-			e.ptrs[suffix] = len(e.buf)
+		if compress {
+			suffix := suffixKey(labels[i:])
+			if off, ok := e.ptrs[suffix]; ok {
+				e.buf = append(e.buf, byte(0xC0|off>>8), byte(off))
+				return nil
+			}
+			// Offsets above 14 bits cannot be expressed as a pointer, so they
+			// are never recorded as compression targets.
+			if len(e.buf) <= 0x3FFF {
+				e.ptrs[suffix] = len(e.buf)
+			}
 		}
 		e.buf = append(e.buf, byte(len(l)))
 		e.buf = append(e.buf, l...)
