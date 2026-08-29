@@ -7,7 +7,7 @@ $ ls go.sum vendor
 ls: cannot access 'go.sum': No such file or directory
 ls: cannot access 'vendor': No such file or directory
 
-$ go list -deps ./... | grep -v '^github.com/DevInIndia/hollow'
+$ CGO_ENABLED=0 go list -deps ./... | grep -v '^github.com/DevInIndia/hollow'
 internal/goarch
 unsafe
 internal/abi
@@ -68,14 +68,62 @@ internal/syscall/execenv
 internal/testlog
 os
 fmt
+context
+strings
+encoding/hex
+encoding
+flag
+hash
+crypto
+bytes
+crypto/internal/fips140deps/godebug
+crypto/internal/fips140
+crypto/internal/fips140/alias
+crypto/internal/fips140deps/byteorder
+crypto/internal/fips140deps/cpu
+crypto/internal/impl
+crypto/internal/fips140/sha256
+crypto/internal/fips140/subtle
+crypto/internal/fips140/sha3
+crypto/internal/fips140/sha512
+crypto/internal/fips140/hmac
+crypto/internal/fips140/check
+crypto/internal/fips140/aes
+crypto/internal/sysrand
+crypto/internal/entropy
+math/rand/v2
+crypto/internal/randutil
+crypto/internal/fips140/drbg
+crypto/internal/fips140/aes/gcm
+crypto/internal/fips140only
+crypto/subtle
+crypto/cipher
+crypto/internal/boring/sig
+crypto/internal/boring
+math/rand
+math/big
+crypto/rand
 encoding/binary
 weak
 unique
 net/netip
-strings
+vendor/golang.org/x/net/dns/dnsmessage
+internal/nettrace
+internal/singleflight
+net
+os/signal
+text/tabwriter
 
-$ go list -deps ./... | grep -v '^github.com/DevInIndia/hollow' | grep '^[^/]*\.'
+$ CGO_ENABLED=0 go list -deps ./... | grep -v '^github.com/DevInIndia/hollow' | grep '^[^/]*\.'
 (no output above this line means zero third-party dependencies)
+
+One line above needs a word: vendor/golang.org/x/net/dns/dnsmessage.
+That is not a dependency of this project. It is part of the Go
+distribution, vendored inside the standard library, and package net
+imports it for the pure-Go resolver. It carries the vendor/ prefix
+precisely because it is not fetched: it ships with the toolchain.
+There is no vendor/ directory in this repository, no require line,
+and no go.sum, all of which the commands above demonstrate.
 
 $ go version
 go version go1.25.0 linux/amd64

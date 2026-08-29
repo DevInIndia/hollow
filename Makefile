@@ -49,6 +49,9 @@ verify:
 # Records the commands as well as their output so a judge can rerun them.
 # A standard library import path never has a dot in its first element, so
 # filtering out this module leaves third-party imports as the only lines that do.
+#
+# CGO_ENABLED=0 because that is how the binary is built. With cgo on, the list
+# gains runtime/cgo and describes an artifact nobody ships.
 deps-proof:
 	{
 		echo "$$ cat go.mod"
@@ -57,12 +60,20 @@ deps-proof:
 		echo "$$ ls go.sum vendor"
 		ls go.sum vendor 2>&1 || true
 		echo
-		echo "$$ go list -deps ./... | grep -v '^$(MODULE)'"
-		go list -deps ./... | grep -v '^$(MODULE)'
+		echo "$$ CGO_ENABLED=0 go list -deps ./... | grep -v '^$(MODULE)'"
+		CGO_ENABLED=0 go list -deps ./... | grep -v '^$(MODULE)'
 		echo
-		echo "$$ go list -deps ./... | grep -v '^$(MODULE)' | grep '^[^/]*\.'"
-		go list -deps ./... | grep -v '^$(MODULE)' | grep '^[^/]*\.' || true
+		echo "$$ CGO_ENABLED=0 go list -deps ./... | grep -v '^$(MODULE)' | grep '^[^/]*\.'"
+		CGO_ENABLED=0 go list -deps ./... | grep -v '^$(MODULE)' | grep '^[^/]*\.' || true
 		echo "(no output above this line means zero third-party dependencies)"
+		echo
+		echo "One line above needs a word: vendor/golang.org/x/net/dns/dnsmessage."
+		echo "That is not a dependency of this project. It is part of the Go"
+		echo "distribution, vendored inside the standard library, and package net"
+		echo "imports it for the pure-Go resolver. It carries the vendor/ prefix"
+		echo "precisely because it is not fetched: it ships with the toolchain."
+		echo "There is no vendor/ directory in this repository, no require line,"
+		echo "and no go.sum, all of which the commands above demonstrate."
 		echo
 		echo "$$ go version"
 		go version
