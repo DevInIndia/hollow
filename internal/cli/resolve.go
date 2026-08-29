@@ -36,6 +36,8 @@ func Resolve(args []string, stdout, stderr io.Writer) int {
 		useTCP  = fs.Bool("tcp", false, "query over TCP instead of falling back to it")
 		timeout = fs.Duration("timeout", resolver.DefaultTimeout, "deadline for one exchange with one server")
 		asJSON  = fs.Bool("json", false, "output reply as JSON")
+		hints   = fs.String("hints", "", "root hints in named.root format; default is the compiled-in list")
+		trace   = fs.Bool("trace", false, "show the delegation path as it is walked")
 	)
 	fs.Usage = func() {
 		fmt.Fprint(stderr, "usage: hollow resolve [flags] <name> [type]\n\nflags:\n")
@@ -62,17 +64,12 @@ func Resolve(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	if *server == "" {
-		fmt.Fprint(stderr, "hollow: iterative resolution is not implemented yet; name a server with --server\n")
-		return ExitFailure
-	}
-	addr, err := netip.ParseAddr(*server)
-	if err != nil {
-		fmt.Fprintf(stderr, "hollow: --server takes an IP address, not a name: %v\n", err)
-		return ExitFailure
-	}
 	if *port == 0 || *port > 65535 {
 		fmt.Fprintf(stderr, "hollow: --port %d is not a port\n", *port)
+		return ExitFailure
+	}
+	if *server != "" && *hints != "" {
+		fmt.Fprint(stderr, "hollow: --hints applies to resolution from the root, so it cannot be used with --server\n")
 		return ExitFailure
 	}
 
@@ -81,22 +78,42 @@ func Resolve(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	tr := &resolver.Transport{
-		Timeout: *timeout,
-		// A server named on the command line is being asked to do the work, so
-		// it needs RD. The iterative loop will run its own Transport with RD
-		// clear, because an authoritative server asked to recurse either
-		// refuses or, worse, does not.
-		RecursionDesired: true,
-		ForceTCP:         *useTCP,
+	tr := resolver.Transport{
+		Timeout:  *timeout,
+		ForceTCP: *useTCP,
 	}
 	q := wire.Question{Name: name, Type: qtype, Class: wire.ClassIN}
 
-	reply, err := tr.Exchange(ctx, netip.AddrPortFrom(addr, uint16(*port)), q)
-	if err != nil {
-		fmt.Fprintf(stderr, "hollow: %v\n", err)
-		return ExitFailure
+	var reply *resolver.Reply
+	if *server != "" {
+		// A server named on the command line is being asked to do the work, so
+		// it gets RD. The iterative path below clears it, because an
+		// authoritative server asked to recurse either refuses or, worse, does
+		// not.
+		tr.RecursionDesired = true
+		addr, err := netip.ParseAddr(*server)
+		if err != nil {
+			fmt.Fprintf(stderr, "hollow: --server takes an IP address, not a name: %v\n", err)
+			return ExitFailure
+		}
+		if reply, err = tr.Exchange(ctx, netip.AddrPortFrom(addr, uint16(*port)), q); err != nil {
+			fmt.Fprintf(stderr, "hollow: %v\n", err)
+			return ExitFailure
+		}
+	} else {
+		res, err := iterate(ctx, tr, q, *hints, uint16(*port), traceWriter(*trace, stderr))
+		if err != nil {
+			fmt.Fprintf(stderr, "hollow: %v\n", err)
+			return ExitFailure
+		}
+		reply = res.Reply
+		// The CNAME links were collected across separate exchanges, so they are
+		// not in the final message. Put them back at the front of the answer,
+		// which is where they would be had one server resolved the chain, and
+		// where a reader expects to find them.
+		reply.Msg.Answers = append(append([]wire.RR{}, res.CNAMEs...), reply.Msg.Answers...)
 	}
+
 	if *asJSON {
 		if err := writeJSON(stdout, reply, q); err != nil {
 			fmt.Fprintf(stderr, "hollow: writing the JSON reply: %v\n", err)

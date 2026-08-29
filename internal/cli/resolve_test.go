@@ -18,8 +18,18 @@ func TestResolveRejectsBadArguments(t *testing.T) {
 		"unknown type":           {"--server", "192.0.2.53", "example.com", "NOTATYPE"},
 		"server given as a name": {"--server", "dns.example", "example.com"},
 		"port out of range":      {"--server", "192.0.2.53", "--port", "70000", "example.com"},
-		"no server and no root":  {"example.com"},
 		"unrecognised flag":      {"--nope", "example.com"},
+
+		// --hints configures where iterative resolution starts, so pairing it
+		// with --server names a starting point that is never used. Silently
+		// ignoring one of two contradictory flags is how a person ends up
+		// believing they tested something they did not.
+		"hints with server": {"--server", "192.0.2.53", "--hints", "/dev/null", "example.com"},
+
+		// A hints file that does not exist must fail before any packet is sent,
+		// rather than falling back to the compiled-in roots and appearing to
+		// work.
+		"missing hints file": {"--hints", "/nonexistent/named.root", "example.com"},
 	}
 
 	for name, args := range tests {

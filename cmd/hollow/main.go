@@ -36,8 +36,8 @@ func usage(w io.Writer) {
 
 usage:
 
-	hollow resolve <name> [type]   resolve a name iteratively from the root
-	hollow serve                   run a caching DNS server
+	hollow resolve <name> [type]   resolve a name from the root servers
+	hollow serve                   run a caching DNS server (not implemented)
 
 Run "hollow <command> -h" for the flags a command accepts.
 `)
