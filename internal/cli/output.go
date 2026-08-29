@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -189,4 +190,87 @@ func className(c wire.Class) string {
 		return "IN"
 	}
 	return fmt.Sprintf("CLASS%d", uint16(c))
+}
+
+type jsonReply struct {
+	Header      jsonHeader   `json:"header"`
+	Question    jsonQuestion `json:"question"`
+	Answers     []jsonRR     `json:"answers,omitempty"`
+	Authority   []jsonRR     `json:"authority,omitempty"`
+	Additional  []jsonRR     `json:"additional,omitempty"`
+	QueryTimeMS int64        `json:"queryTimeMs"`
+	Server      string       `json:"server"`
+	Protocol    string       `json:"protocol"`
+	Size        int          `json:"sizeBytes"`
+}
+
+type jsonHeader struct {
+	ID                 uint16 `json:"id"`
+	Opcode             string `json:"opcode"`
+	Status             string `json:"status"`
+	Flags              string `json:"flags,omitempty"`
+	Response           bool   `json:"qr"`
+	Authoritative      bool   `json:"aa,omitempty"`
+	Truncated          bool   `json:"tc,omitempty"`
+	RecursionDesired   bool   `json:"rd,omitempty"`
+	RecursionAvailable bool   `json:"ra,omitempty"`
+}
+
+type jsonQuestion struct {
+	Name  string `json:"name"`
+	Type  string `json:"type"`
+	Class string `json:"class"`
+}
+
+type jsonRR struct {
+	Name  string `json:"name"`
+	Type  string `json:"type"`
+	Class string `json:"class"`
+	TTL   int32  `json:"ttl"`
+	Data  string `json:"data"`
+}
+
+func writeJSON(w io.Writer, r *resolver.Reply, q wire.Question) error {
+	m := r.Msg
+	hdr := jsonHeader{
+		ID:                 m.Header.ID,
+		Opcode:             opcodeName(m.Header.Opcode),
+		Status:             rcodeName(m.Header.Rcode),
+		Flags:              strings.TrimSpace(flagNames(m.Header)),
+		Response:           m.Header.Response,
+		Authoritative:      m.Header.Authoritative,
+		Truncated:          m.Header.Truncated,
+		RecursionDesired:   m.Header.RecursionDesired,
+		RecursionAvailable: m.Header.RecursionAvailable,
+	}
+
+	mapRRs := func(rrs []wire.RR) []jsonRR {
+		var out []jsonRR
+		for _, rr := range rrs {
+			out = append(out, jsonRR{
+				Name:  string(rr.Name),
+				Type:  rr.Type.String(),
+				Class: className(rr.Class),
+				TTL:   rr.TTL,
+				Data:  rdataText(rr.Data),
+			})
+		}
+		return out
+	}
+
+	out := jsonReply{
+		Header:      hdr,
+		Question:    jsonQuestion{Name: string(q.Name), Type: q.Type.String(), Class: className(q.Class)},
+		Answers:     mapRRs(m.Answers),
+		Authority:   mapRRs(m.Authority),
+		Additional:  mapRRs(m.Additional),
+		QueryTimeMS: r.RTT.Milliseconds(),
+		Server:      fmt.Sprintf("%s#%d", r.Server.Addr(), r.Server.Port()),
+		Protocol:    r.Protocol,
+		Size:        r.Size,
+	}
+
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(out)
 }

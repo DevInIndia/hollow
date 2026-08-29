@@ -35,6 +35,7 @@ func Resolve(args []string, stdout, stderr io.Writer) int {
 		port    = fs.Uint("port", 53, "port to query")
 		useTCP  = fs.Bool("tcp", false, "query over TCP instead of falling back to it")
 		timeout = fs.Duration("timeout", resolver.DefaultTimeout, "deadline for one exchange with one server")
+		asJSON  = fs.Bool("json", false, "output reply as JSON")
 	)
 	fs.Usage = func() {
 		fmt.Fprint(stderr, "usage: hollow resolve [flags] <name> [type]\n\nflags:\n")
@@ -96,7 +97,12 @@ func Resolve(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "hollow: %v\n", err)
 		return ExitFailure
 	}
-	if err := writeDig(stdout, reply, q); err != nil {
+	if *asJSON {
+		if err := writeJSON(stdout, reply, q); err != nil {
+			fmt.Fprintf(stderr, "hollow: writing the JSON reply: %v\n", err)
+			return ExitFailure
+		}
+	} else if err := writeDig(stdout, reply, q); err != nil {
 		fmt.Fprintf(stderr, "hollow: writing the reply: %v\n", err)
 		return ExitFailure
 	}

@@ -157,3 +157,37 @@ func TestWriteDig(t *testing.T) {
 		t.Errorf("the OPT record was not printed at all\n%s", got)
 	}
 }
+
+func TestWriteJSON(t *testing.T) {
+	q := wire.Question{Name: "example.com.", Type: wire.TypeA, Class: wire.ClassIN}
+	m := &wire.Message{
+		Header: wire.Header{
+			ID:                 0x1234,
+			Response:           true,
+			RecursionDesired:   true,
+			RecursionAvailable: true,
+		},
+		Questions: []wire.Question{q},
+		Answers: []wire.RR{{
+			Name: "example.com.", Type: wire.TypeA, Class: wire.ClassIN, TTL: 300,
+			Data: wire.A{Addr: netip.MustParseAddr("192.0.2.1")},
+		}},
+	}
+	var out strings.Builder
+	reply := &resolver.Reply{
+		Msg:      m,
+		Server:   netip.MustParseAddrPort("192.0.2.53:53"),
+		Protocol: "udp",
+		Size:     61,
+		RTT:      20 * time.Millisecond,
+	}
+	if err := writeJSON(&out, reply, q); err != nil {
+		t.Fatalf("writeJSON() = %v", err)
+	}
+	got := out.String()
+	for _, expectedKey := range []string{`"header":`, `"question":`, `"answers":`, `"queryTimeMs":`, `"192.0.2.1"`} {
+		if !strings.Contains(got, expectedKey) {
+			t.Errorf("JSON output missing %s\n%s", expectedKey, got)
+		}
+	}
+}
