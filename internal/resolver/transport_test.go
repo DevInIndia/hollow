@@ -7,8 +7,10 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/DevInIndia/hollow/internal/wire"
@@ -465,5 +467,107 @@ func TestUDPSizeFloor(t *testing.T) {
 		if got := (&Transport{UDPSize: in}).udpSize(); got != want {
 			t.Errorf("udpSize(%d) = %d, want %d", in, got, want)
 		}
+	}
+}
+
+// The two tests below run inside a synctest bubble, where the time package uses
+// a fake clock that advances only when every goroutine is durably blocked. That
+// makes a deadline assertion exact rather than a tolerance window.
+//
+// The bubble cannot be pushed further up. A goroutine parked in a read on a real
+// socket can be woken by a packet from outside the bubble, so it is not durably
+// blocked, the clock never advances and the test hangs. Verified: wrapping
+// TestExchangeHonoursCancellation in synctest.Test times out rather than
+// failing. net.Pipe blocks on channels created inside the bubble, which is why
+// it works here and a UDP socket does not.
+
+func TestWatchUnblocksOnCancel(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		conn, peer := net.Pipe()
+		defer conn.Close()
+		defer peer.Close()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		stop := watch(ctx, conn)
+		defer stop()
+
+		read := make(chan error, 1)
+		go func() {
+			_, err := conn.Read(make([]byte, 1))
+			read <- err
+		}()
+
+		// Returns once the read is parked, so the cancel below is unambiguously
+		// interrupting a blocked read rather than racing to get there first.
+		synctest.Wait()
+
+		cancel()
+		if err := <-read; !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("Read() = %v, want the read to be unblocked by the cancel", err)
+		}
+	})
+}
+
+func TestWatchUnblocksOnDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		conn, peer := net.Pipe()
+		defer conn.Close()
+		defer peer.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		stop := watch(ctx, conn)
+		defer stop()
+
+		start := time.Now()
+		if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("Read() = %v, want a deadline error", err)
+		}
+		// Exactly, not approximately. The context's deadline is the socket's.
+		if got := time.Since(start); got != 3*time.Second {
+			t.Errorf("the read unblocked after %v, want 3s", got)
+		}
+	})
+}
+
+// The defect this pins: the context's timer and the socket deadline derived from
+// it expire at the same instant and race, so a read can report a timeout a
+// moment before ctx.Err() is set. Whichever wins, the caller must see the same
+// error. Reproducing the race takes go test -count and luck; calling failure
+// with each outcome takes neither.
+func TestFailureDoesNotDependOnWhichTimerWon(t *testing.T) {
+	server := netip.MustParseAddrPort("192.0.2.53:53")
+
+	expired, cancelExpired := context.WithTimeout(context.Background(), 0)
+	defer cancelExpired()
+	<-expired.Done()
+
+	live, cancelLive := context.WithTimeout(context.Background(), time.Hour)
+	defer cancelLive()
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	tests := map[string]struct {
+		ctx  context.Context
+		err  error
+		want error
+	}{
+		// The socket noticed the deadline; the context has not caught up.
+		"socket first":  {live, os.ErrDeadlineExceeded, ErrNoReply},
+		"context first": {expired, os.ErrDeadlineExceeded, ErrNoReply},
+		// A cancel sets ctx.Err() before it wakes anything, so there is no race
+		// here and the caller gets its own error back rather than ErrNoReply.
+		"cancelled":  {cancelled, os.ErrDeadlineExceeded, context.Canceled},
+		"other read": {live, io.ErrUnexpectedEOF, io.ErrUnexpectedEOF},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := failure(tc.ctx, tc.err, server, "udp", "reading the reply"); !errors.Is(got, tc.want) {
+				t.Errorf("failure() = %v, want it to carry %v", got, tc.want)
+			}
+		})
 	}
 }
