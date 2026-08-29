@@ -35,9 +35,14 @@ verify:
 	test -z "$$(gofmt -l .)"
 	go vet ./...
 	go test -race ./...
+	# Every package, not just $(PKG). The command imports none of the internal
+	# tree yet, so building it alone cross-compiled 45 lines of main.go and left
+	# the actual code unchecked. No -o: with more than one package go build
+	# discards its output already, and -o refuses a second main package, which
+	# is a failure that would arrive on the day a second command is added.
 	for t in "linux amd64" "linux arm64" "darwin arm64" "windows amd64"; do
 		set -- $$t
-		CGO_ENABLED=0 GOOS=$$1 GOARCH=$$2 go build -o /dev/null $(PKG)
+		CGO_ENABLED=0 GOOS=$$1 GOARCH=$$2 go build ./...
 	done
 	echo "VERIFY: all checks passed"
 
