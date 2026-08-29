@@ -6,32 +6,28 @@ import (
 	"fmt"
 	"io"
 	"os"
-)
 
-// Exit codes are part of the command-line contract, so callers can branch on a
-// name that does not resolve without parsing output.
-const (
-	exitOK       = 0
-	exitNXDomain = 1
-	exitFailure  = 2
+	"github.com/DevInIndia/hollow/internal/cli"
 )
 
 func main() {
 	if len(os.Args) < 2 {
 		usage(os.Stderr)
-		os.Exit(exitFailure)
+		os.Exit(cli.ExitFailure)
 	}
 
 	switch verb := os.Args[1]; verb {
 	case "help", "-h", "--help":
 		usage(os.Stdout)
-	case "resolve", "serve":
+	case "resolve":
+		os.Exit(cli.Resolve(os.Args[2:], os.Stdout, os.Stderr))
+	case "serve":
 		fmt.Fprintf(os.Stderr, "hollow: %s is not implemented yet\n", verb)
-		os.Exit(exitFailure)
+		os.Exit(cli.ExitFailure)
 	default:
 		fmt.Fprintf(os.Stderr, "hollow: unknown command %q\n", verb)
 		usage(os.Stderr)
-		os.Exit(exitFailure)
+		os.Exit(cli.ExitFailure)
 	}
 }
 
