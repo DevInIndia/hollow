@@ -43,6 +43,16 @@ func TestServeRejectsBadArguments(t *testing.T) {
 		// file does: a resolver that is running but not filtering looks exactly
 		// like one that is.
 		"an unknown block mode": {"--block-mode", "refuse"},
+
+		// A forwarder has to be an address. Resolving the name of the server
+		// that resolves names needs a resolver, and the one in this process is
+		// the one being configured.
+		"a forwarder given as a name":  {"--forward", "dns.example.com"},
+		"a forwarder that is nonsense": {"--forward", "1.1.1.1:99999"},
+
+		// --hints names the roots to start a walk from, and forwarding does not
+		// walk.
+		"hints with forwarding": {"--forward", "1.1.1.1", "--hints", "/nonexistent/named.root"},
 		"a missing block file":  {"--block", "/nonexistent/hosts"},
 
 		// An allowlist with no blocklist to override does nothing at all.
@@ -459,5 +469,65 @@ func TestStringListCollectsRepeatedFlags(t *testing.T) {
 	}
 	if got := s.String(); got != "one,two" {
 		t.Errorf("String() = %q, want \"one,two\"", got)
+	}
+}
+
+func TestParseServersTakesAddressesWithOrWithoutAPort(t *testing.T) {
+	got, err := parseServers([]string{"1.1.1.1", "127.0.0.1:5353", "2606:4700:4700::1111", "[::1]:5300"})
+	if err != nil {
+		t.Fatalf("parseServers: %v", err)
+	}
+	want := []string{"1.1.1.1:53", "127.0.0.1:5353", "[2606:4700:4700::1111]:53", "[::1]:5300"}
+	if len(got) != len(want) {
+		t.Fatalf("parseServers returned %d servers, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].String() != want[i] {
+			t.Errorf("server %d = %s, want %s", i, got[i], want[i])
+		}
+	}
+
+	// A bare IPv6 address must not be read as a host and a port, which is what
+	// makes the order of the two parse attempts matter.
+	if _, err := parseServers([]string{"dns.google"}); err == nil {
+		t.Error("parseServers accepted a name")
+	}
+}
+
+func TestReportModeSaysWhereAnswersComeFrom(t *testing.T) {
+	var out strings.Builder
+	reportMode(&out, nil)
+	if !strings.Contains(out.String(), "from the root") {
+		t.Errorf("iterative mode printed %q", out.String())
+	}
+
+	out.Reset()
+	servers, err := parseServers([]string{"1.1.1.1", "8.8.8.8"})
+	if err != nil {
+		t.Fatalf("parseServers: %v", err)
+	}
+	reportMode(&out, servers)
+	got := out.String()
+	for _, want := range []string{"1.1.1.1:53", "8.8.8.8:53", "in order", "not walked"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("forwarding mode line is missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// The handler is indifferent to which resolver it holds, which is the whole
+// reason answerer is an interface. A Forwarder with no servers fails every
+// query, and the handler turns that into SERVFAIL exactly as it does for a
+// failed walk.
+func TestTheHandlerAcceptsAForwarder(t *testing.T) {
+	col := stats.New()
+	rc := &recursor{resolver: &resolver.Forwarder{}, log: discard(), stats: col}
+
+	reply := ask(t, rc, "example.com.", wire.TypeA)
+	if reply.Header.Rcode != wire.RcodeServFail {
+		t.Errorf("rcode = %d, want SERVFAIL", reply.Header.Rcode)
+	}
+	if s := col.Snapshot(); s.UpstreamErrors != 1 {
+		t.Errorf("UpstreamErrors = %d, want 1", s.UpstreamErrors)
 	}
 }

@@ -45,7 +45,8 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 		stale   = fs.Duration("serve-stale", 0, "how long past expiry an answer may still be served when resolution fails; 0 disables")
 		mode    = fs.String("block-mode", "nxdomain", "how a blocked name is answered: nxdomain, null or nodata")
 	)
-	var block, allow stringList
+	var forward, block, allow stringList
+	fs.Var(&forward, "forward", "resolve by asking this server instead of walking from the root; repeatable, tried in order")
 	fs.Var(&block, "block", "blocklist file in hosts, domain-per-line or adblock format; repeatable")
 	fs.Var(&allow, "allow", "allowlist file in the same formats, overriding every block; repeatable")
 	fs.Usage = func() {
@@ -72,6 +73,19 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 		// configuration with a sensible reading, and silently ignoring one of
 		// two flags the operator set is worse than refusing both.
 		fmt.Fprintln(stderr, "hollow: --serve-stale needs a cache, but --cache-size is 0")
+		return ExitFailure
+	}
+	if len(forward) > 0 && *hints != "" {
+		// --hints names the roots to start a walk from, and forwarding does not
+		// walk. Same reasoning as the resolve verb refusing --hints with
+		// --server: honouring one and dropping the other silently would leave
+		// the operator believing they got something they did not.
+		fmt.Fprintln(stderr, "hollow: --hints applies to resolution from the root, so it cannot be used with --forward")
+		return ExitFailure
+	}
+	forwarders, err := parseServers(forward)
+	if err != nil {
+		fmt.Fprintf(stderr, "hollow: %v\n", err)
 		return ExitFailure
 	}
 	blockMode, err := blocklist.ParseMode(*mode)
@@ -103,21 +117,31 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 	}
 	log := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level}))
 
-	// The resolver is built once and shared. It holds no per-query state, so
-	// every worker uses the same one rather than re-reading the hints file and
-	// re-shuffling a fresh copy of the roots on every packet.
-	r, err := newResolver(resolver.Transport{Timeout: resolver.DefaultTimeout}, *hints, 53, nil)
-	if err != nil {
-		fmt.Fprintf(stderr, "hollow: %v\n", err)
-		return ExitFailure
+	// One cache for the whole process, so that what one client's query learned
+	// is there for the next client's. A cache per worker would divide the hit
+	// rate by the size of the pool and hold sixty-four copies of the same
+	// answers. It is shared by both resolution modes: an answer is an answer
+	// whether it was walked to or asked for.
+	var store *cache.Cache
+	if *size > 0 {
+		store = cache.New(cache.Config{Entries: *size, StaleFor: *stale})
 	}
 
-	// One cache for the whole process, hanging off the shared resolver, so that
-	// what one client's query learned is there for the next client's. A cache
-	// per worker would divide the hit rate by the size of the pool and hold
-	// sixty-four copies of the same answers.
-	if *size > 0 {
-		r.Cache = cache.New(cache.Config{Entries: *size, StaleFor: *stale})
+	// Built once and shared. Neither implementation holds per-query state, so
+	// every worker uses the same one rather than re-reading the hints file and
+	// re-shuffling a fresh copy of the roots on every packet.
+	var answer answerer
+	transport := resolver.Transport{Timeout: resolver.DefaultTimeout}
+	if len(forwarders) > 0 {
+		answer = &resolver.Forwarder{Transport: transport, Servers: forwarders, Cache: store}
+	} else {
+		r, err := newResolver(transport, *hints, 53, nil)
+		if err != nil {
+			fmt.Fprintf(stderr, "hollow: %v\n", err)
+			return ExitFailure
+		}
+		r.Cache = store
+		answer = r
 	}
 
 	// Statistics are always collected. There is no flag to turn them off
@@ -125,14 +149,14 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 	// update and a send that cannot block, against a query that may spend half
 	// a second on the network. A knob here would only be a knob to get wrong.
 	col := stats.New()
-	if r.Cache != nil {
+	if store != nil {
 		// The one number that cannot be accumulated from events, because it is
 		// a level rather than a total.
-		col.CacheEntries = r.Cache.Len
+		col.CacheEntries = store.Len
 	}
 
 	s := &server.Server{
-		Handler: &recursor{resolver: r, log: log, stats: col, blocks: blocks, blockMode: blockMode},
+		Handler: &recursor{resolver: answer, log: log, stats: col, blocks: blocks, blockMode: blockMode},
 		Workers: *workers,
 		Timeout: *timeout,
 		Log:     log,
@@ -150,8 +174,11 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 
 	fmt.Fprintf(stdout, "hollow listening on %s, udp and tcp\n", conns.Addr())
+	reportMode(stdout, forwarders)
 	switch {
-	case r.Cache == nil:
+	case store == nil && len(forwarders) > 0:
+		fmt.Fprintln(stdout, "cache disabled, every query is forwarded")
+	case store == nil:
 		fmt.Fprintln(stdout, "cache disabled, every query walks from the root")
 	case *stale > 0:
 		fmt.Fprintf(stdout, "cache holding %d answers, serving stale for up to %v\n", *size, *stale)
@@ -164,11 +191,11 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "hollow: %v\n", err)
 		return ExitFailure
 	}
-	if r.Cache != nil {
+	if store != nil {
 		// Reported at the end for the same reason the server reports dropped
 		// packets there: a number nobody can see is a number nobody checks, and
 		// the hit rate is the whole claim this feature is making.
-		st := r.Cache.Stats()
+		st := store.Stats()
 		fmt.Fprintf(stdout, "cache: %d hits, %d misses, %d served stale, %d entries, %d evicted\n",
 			st.Hits, st.Misses, st.Stale, st.Entries, st.Evictions)
 	}
@@ -189,6 +216,50 @@ func (s *stringList) Set(v string) error {
 	}
 	*s = append(*s, v)
 	return nil
+}
+
+// parseServers reads the --forward addresses.
+//
+// A bare address gets port 53, and an address with a port keeps it, which means
+// "1.1.1.1" and "127.0.0.1:5353" both work. ParseAddrPort is tried first
+// because ParseAddr accepts "2606:4700:4700::1111" and would happily read a
+// bracketed IPv6 address with a port as neither.
+//
+// An address, never a name. Resolving the name of the server that resolves
+// names needs a resolver, and the one in this process is the one being
+// configured.
+func parseServers(list []string) ([]netip.AddrPort, error) {
+	var out []netip.AddrPort
+	for _, s := range list {
+		if ap, err := netip.ParseAddrPort(s); err == nil {
+			out = append(out, ap)
+			continue
+		}
+		addr, err := netip.ParseAddr(s)
+		if err != nil {
+			return nil, fmt.Errorf("--forward %q takes an IP address, optionally with a port, not a name", s)
+		}
+		out = append(out, netip.AddrPortFrom(addr, 53))
+	}
+	return out, nil
+}
+
+// reportMode says where answers are going to come from.
+//
+// Worth a line of its own because it is the one thing about a running hollow
+// that a person cannot infer from watching it answer. Both modes return the
+// same answers to the same queries; only the trust model differs, and that is
+// exactly the sort of thing that should not be silent.
+func reportMode(w io.Writer, forwarders []netip.AddrPort) {
+	if len(forwarders) == 0 {
+		fmt.Fprintln(w, "resolving iteratively from the root")
+		return
+	}
+	names := make([]string, len(forwarders))
+	for i, f := range forwarders {
+		names[i] = f.String()
+	}
+	fmt.Fprintf(w, "forwarding to %s, tried in order; the delegation path is not walked\n", strings.Join(names, ", "))
 }
 
 // reportBlocklist says what was loaded, at startup, where an operator is still
@@ -248,12 +319,30 @@ const (
 	wasBlocked = true
 )
 
-// recursor answers a query by resolving it from the root.
+// answerer is the one thing the handler needs from whatever does the resolving:
+// a question in, a result out.
+//
+// An interface here rather than a concrete type because there are two
+// implementations and the handler is genuinely indifferent between them.
+// resolver.Resolver walks the delegation path from the root; resolver.Forwarder
+// asks a server the operator named. Everything around it, the blocklist, the
+// coalescing map, the statistics and the reply construction, is identical for
+// both and would be duplicated line for line by a second Handler.
+type answerer interface {
+	Resolve(ctx context.Context, q wire.Question) (*resolver.Result, error)
+}
+
+// recursor answers a query by resolving it.
+//
+// Still the right name in forwarding mode. What the client is talking to is a
+// recursive resolver either way: it sets RA, it does the whole job, and it
+// returns a final answer rather than a referral. Where that answer comes from
+// is this server's business and not the client's.
 //
 // It must not be copied: inflight holds a mutex, and every use of a recursor is
 // through the pointer stored in the server's Handler field.
 type recursor struct {
-	resolver *resolver.Resolver
+	resolver answerer
 	log      *slog.Logger
 
 	// stats records what was answered. Nil disables it, which is what the
