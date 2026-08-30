@@ -1,0 +1,17 @@
+# The Dockerfile copies the whole tree in one COPY, so this file is what keeps
+# that honest. Everything here is either build output or not part of the
+# shipped artifact.
+
+# Planning notes, gitignored and not for distribution.
+files/
+
+# Build output. dist/ is four binaries and several megabytes of build context
+# that the image would carry across to the daemon for nothing.
+dist/
+build/
+hollow
+hollow.exe
+
+# Git metadata. The build uses -buildvcs=false, so it is not read, and shipping
+# the history into a build context is pure weight.
+.git/

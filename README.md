@@ -16,10 +16,16 @@ Unlike standard DNS utilities and servers, `hollow` is built from the ground up 
 
 ## Quick Start
 
-Build the binary from source:
+Build the binary from source. There is nothing to fetch first:
 
 ```bash
 go build ./cmd/hollow
+```
+
+Or take a released binary for your platform and check it against the [table below](#reproducible-build-proof), or build the container:
+
+```bash
+docker build -t hollow . && docker run --rm -p 15353:15353/udp hollow
 ```
 
 ## Example Usage
@@ -385,11 +391,11 @@ What the numbers say, which is the reason they are here rather than in a footnot
 * **The cache does not survive the process**: answers and delegations are held in memory only, so a restart starts cold and every name is walked again. `hollow resolve` is a fresh process per invocation and therefore runs with no cache at all, which is why a single `resolve` is no faster the second time while `serve` is.
 * **Serve-stale does not refresh in the background**: RFC 8767 says to continue the resolution attempt after the stale answer is sent. `hollow` does not spawn a detached refresh, because an unbounded set of background resolutions is exactly what the bounded worker pool exists to prevent. The next query for the name retries instead, so an expired entry stays expired until somebody asks for it again.
 * **The server passes on no additional records**: an answer to an MX or SRV query arrives without the addresses of the hosts it names, so the client looks them up itself. The upstream additional section is dropped rather than forwarded, because unlike the glue used during resolution it was never bailiwick-checked, and forwarding unchecked records to a client is how a resolver launders someone else's data.
-* **Blocklists are read once, at startup**: there is no reload, so changing a list means restarting the server. Reload belongs on a control socket, which is not built. `SIGHUP` is the usual answer and is not one here, because it does not exist on Windows and this repository cross-compiles for it.
+* **Blocklists are read once, at startup**: there is no reload, so changing a list means restarting the server. The control socket would be the place for one, and it deliberately does not have it: every command on it reads, none of them change what the server is doing, which is what makes a loopback port with no authentication a defensible thing to open. `SIGHUP` is the usual answer and is not one here, because it does not exist on Windows and this repository cross-compiles for it.
 * **The allowlist is global, not per-client**: an allowed name is allowed for everybody that can reach the server. There is no notion of which client asked, beyond the address recorded in the statistics.
 * **A forwarded answer is trusted absolutely**: under `--forward` there is no delegation path, so none of the checks that make the iterative walk safe are available. `hollow` returns what the forwarder said. Choosing a forwarder is choosing whom to believe, and that is the entire security model of the mode.
 * **Forwarders are not health checked or timed**: they are tried in the order written, every time, and a server that is merely slow is used ahead of a fast one below it for as long as it keeps answering. Failover happens per query, on failure, with no memory of it: a dead first forwarder costs every query one timeout rather than being marked down.
-* **No per-client accounting**: the worker pool, the connection cap and the query budget are all global. A single client can occupy the whole server, and there is no rate limiting.
+* **The resource limits are global, not per client**: the worker pool, the connection cap and the query budget are shared, so one client sending enough queries can occupy all of them. Rate limiting is the only thing that counts per client, and it counts responses sent rather than work done, so it caps the traffic leaving the server without giving any single client a share of the machine.
 * **DNSSEC is not implemented, and was not attempted**: EDNS0 is there and queries advertise a 1232-octet payload size, and the DO bit is decoded and displayed when a server sets it, but there is no flag to request DNSSEC records and nothing validates them. A forged delegation from a compromised parent zone would not be detected. This is a deliberate omission rather than an unfinished feature: validation means a chain of trust from the root, NSEC and NSEC3 denial of existence, several signature algorithms and their key rollovers, and getting it half right is worse than not claiming it, because a resolver that reports AD on evidence it did not check is lying to everything downstream. The defences that are here, 0x20 and source port randomisation, raise the cost of forging an answer; they do not prove one is genuine, and nothing here claims otherwise.
 * **0x20 protects the path, not the server at the end of it**: a randomised case pattern makes an off-path forgery expensive. It does nothing about a nameserver that is itself compromised or lying, because that server echoes the nonce correctly. It also carries no entropy at all for a name with no letters in it, and very little for a short one.
 * **Rate limiting counts responses, not amplification**: the limit is a flat rate per client network. It does not score a client's behaviour, weigh the response size against the query size, or notice that a source is asking only for the record types that amplify best. Those signals are real and BIND-like implementations use them; what is here is the mechanism that stops the traffic, without the classifier that would decide more cleverly whom to stop it for.
@@ -446,15 +452,50 @@ All three are recorded with their output in [deps-proof.txt](deps-proof.txt), an
 
 `hollow` builds reproducibly: the same source produces a byte-identical binary, from any directory, because `-trimpath` keeps the build path out of it.
 
-* **SHA-256, linux/amd64, go1.25.0, `CGO_ENABLED=0`**: `f78de0717237d4c419ab15df17b02e2fd7350d9f256e09019712224b37b4d9f6`
-* The hash is of the binary this commit builds and is specific to that platform and toolchain. A build for another target will differ, and so will this line after any change to `cmd/hollow` or anything it imports.
-* Verify reproducibility locally:
+`make release` cross-compiles four targets with those flags and writes `dist/SHA256SUMS`. All four, built with go1.25.0 and `CGO_ENABLED=0`:
+
+| Target | Artifact | SHA-256 |
+| --- | --- | --- |
+| linux/amd64 | `hollow-linux-amd64` | `f78de0717237d4c419ab15df17b02e2fd7350d9f256e09019712224b37b4d9f6` |
+| linux/arm64 | `hollow-linux-arm64` | `d38e48489415cbf6f48fc3fed6ee4210302b639c0ac77bb2900213fe09a58951` |
+| darwin/arm64 | `hollow-darwin-arm64` | `63789b3073fa0f68a4aca70b9ec56065e5fa927e91abf5c52e710aa6bf7be67f` |
+| windows/amd64 | `hollow-windows-amd64.exe` | `faf2bd311d873cadf691425af7328a629143190f7f1fd3fe219d0209f94b8888` |
+
+**Only the first row is gated.** `make verify` rebuilds and compares against the linux/amd64 hash, because that is the platform this repository was built on and the only one whose bytes it can reproduce. The other three come from the same command and the same flags, and this file says so rather than implying a check that did not happen. Publishing three hashes as if all four were verified would undo the point of publishing any.
+
+The gated row is not a promise, it is a gate. `make verify` reads the SHA-256 out of this file by the platform named beside it, rebuilds, and fails if the two differ, so a stale hash breaks the build rather than quietly misleading a reader. On any other platform or toolchain it says it stood aside, and why. A hash changes after any change to `cmd/hollow` or anything it imports.
+
+Verify locally:
 
 ```bash
-make reproduce
+make reproduce   # builds twice from the same source and compares the bytes
+make release     # writes dist/ and dist/SHA256SUMS
 ```
 
-The published hash is not a promise, it is a gate. `make verify` reads the SHA-256 out of this file, rebuilds, and fails if the two differ, so a stale hash breaks the build rather than quietly misleading a reader. On a platform other than the one above it says it stood aside, and why.
+Downloaders check a release against the table with `sha256sum -c SHA256SUMS` from the directory the artifacts land in.
+
+### The same bytes out of a container
+
+[Dockerfile](Dockerfile) is a multi-stage build ending at `FROM scratch`: one layer, one static binary, 5.11 MB. It is a second build path and also a second check on the number above, because the builder image is pinned to `golang:1.25.0` and uses the same flags, so the binary inside the image is byte identical to the gated row:
+
+```bash
+docker build -t hollow .
+id=$(docker create hollow) && docker cp "$id":/hollow ./hollow-image && docker rm "$id"
+sha256sum hollow-image      # f78de0717237d4c419ab15df17b02e2fd7350d9f256e09019712224b37b4d9f6
+```
+
+The floating `golang:1.25` tag was go1.25.14 when this was written and produced a different binary, which is the expected result and the reason for the pin: a build is reproducible for one toolchain, not for a tag that moves.
+
+Three things are deliberately absent from the final stage. There is no CA bundle, because DNS over UDP and TCP carries no TLS and the resolver's trust comes from its compiled-in root hints. There is no `/etc/resolv.conf`, because `hollow` walks from the root rather than asking the host resolver. And there is no `go mod download` in the build stage, which is the first line of nearly every Go Dockerfile and has nothing to do here.
+
+It runs as uid 65534, which port 15353 rather than 53 is what makes possible:
+
+```bash
+docker run --rm -p 15353:15353/udp -p 15353:15353/tcp hollow
+dig @127.0.0.1 -p 15353 example.com
+```
+
+The `CMD` binds `0.0.0.0` rather than the loopback default, since inside a container loopback is the container's own and a published port would reach nothing. Who can actually see it is then decided by `-p`, which is the boundary that belongs to the operator.
 
 ## Submission Notes
 

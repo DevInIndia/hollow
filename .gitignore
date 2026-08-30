@@ -6,3 +6,8 @@
 /hollow
 /hollow.exe
 /build/
+
+# Release artifacts. Binaries belong on the release page, not in the history:
+# committing them would put four megabytes into every clone for a file that is
+# rebuilt byte for byte by make release.
+/dist/

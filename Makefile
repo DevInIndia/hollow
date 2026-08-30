@@ -25,7 +25,11 @@ HASH_GOOS      := linux
 HASH_GOARCH    := amd64
 HASH_TOOLCHAIN := go1.25.0
 
-.PHONY: build test verify hash-check deps-proof reproduce
+# The four targets the verify gate cross-compiles and the release publishes.
+# One list, so a target that is released is a target that is known to build.
+TARGETS := linux/amd64 linux/arm64 darwin/arm64 windows/amd64
+
+.PHONY: build test verify hash-check deps-proof reproduce release
 
 build:
 	CGO_ENABLED=0 go build $(REPRO) -o $(BINARY) $(PKG)
@@ -48,9 +52,8 @@ verify:
 	# the actual code unchecked. No -o: with more than one package go build
 	# discards its output already, and -o refuses a second main package, which
 	# is a failure that would arrive on the day a second command is added.
-	for t in "linux amd64" "linux arm64" "darwin arm64" "windows amd64"; do
-		set -- $$t
-		CGO_ENABLED=0 GOOS=$$1 GOARCH=$$2 go build ./...
+	for t in $(TARGETS); do
+		CGO_ENABLED=0 GOOS=$${t%/*} GOARCH=$${t#*/} go build ./...
 	done
 	$(MAKE) --no-print-directory hash-check
 	echo "VERIFY: all checks passed"
@@ -69,9 +72,15 @@ hash-check:
 
 	# Read the hash rather than trusting a copy of it: the README is the
 	# published artifact, so it is the README that has to be right.
-	published=$$(grep -oE '\b[0-9a-f]{64}\b' README.md | head -n 1)
+	#
+	# The hash is found by the platform named beside it, not by being first in
+	# the file. Taking the first 64-hex string worked while exactly one hash was
+	# published and became a silent trap the moment the README grew a table of
+	# four: reordering the rows would have compared this build against another
+	# platform's hash and failed with nothing to suggest why.
+	published=$$(grep -E '$(HASH_GOOS)/$(HASH_GOARCH)' README.md | grep -oE '\b[0-9a-f]{64}\b' | head -n 1)
 	if [ -z "$$published" ]; then
-		echo "HASH: README.md publishes no SHA-256" >&2
+		echo "HASH: README.md publishes no SHA-256 for $(HASH_GOOS)/$(HASH_GOARCH)" >&2
 		exit 1
 	fi
 
@@ -122,6 +131,34 @@ deps-proof:
 		go version
 	} > deps-proof.txt
 	cat deps-proof.txt
+
+# Cross-compiled artifacts for a release, built with the same flags as the hash
+# gate so that the linux/amd64 row of the published table is the same artifact
+# the gate checks on every commit.
+#
+# Named with their platform, because the one thing a downloader must not have to
+# guess is which file is theirs, and .exe on Windows because a browser there
+# will not run a file without it.
+release:
+	rm -rf dist
+	mkdir -p dist
+	for t in $(TARGETS); do
+		os=$${t%/*}
+		arch=$${t#*/}
+		out=dist/$(BINARY)-$$os-$$arch
+		if [ "$$os" = windows ]; then out=$$out.exe; fi
+		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build $(REPRO) -o $$out $(PKG)
+	done
+
+	# A subshell, because .ONESHELL runs this whole recipe in one shell and a cd
+	# here would move every line after it. The cd is what keeps bare filenames
+	# in the sums file, so sha256sum -c works from the directory a downloader
+	# unpacks into. The glob names the binaries rather than everything, since
+	# redirection creates SHA256SUMS before the glob expands and it would
+	# otherwise checksum itself.
+	( cd dist && sha256sum $(BINARY)-* > SHA256SUMS )
+	cat dist/SHA256SUMS
+	echo "RELEASE: dist/ holds $$(ls dist | grep -c '^$(BINARY)-') binaries and their sums"
 
 reproduce:
 	mkdir -p build
