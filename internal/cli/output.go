@@ -155,23 +155,7 @@ func flagNames(h wire.Header) string {
 	return b.String()
 }
 
-func rcodeName(rcode uint8) string {
-	switch rcode {
-	case wire.RcodeSuccess:
-		return "NOERROR"
-	case wire.RcodeFormErr:
-		return "FORMERR"
-	case wire.RcodeServFail:
-		return "SERVFAIL"
-	case wire.RcodeNXDomain:
-		return "NXDOMAIN"
-	case wire.RcodeNotImp:
-		return "NOTIMP"
-	case wire.RcodeRefused:
-		return "REFUSED"
-	}
-	return fmt.Sprintf("RCODE%d", rcode)
-}
+func rcodeName(rcode uint8) string { return wire.RcodeName(rcode) }
 
 func opcodeName(opcode uint8) string {
 	switch opcode {

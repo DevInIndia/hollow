@@ -27,6 +27,10 @@ func main() {
 		os.Exit(cli.Inspect(os.Args[2:], os.Stdout, os.Stderr))
 	case "serve":
 		os.Exit(cli.Serve(os.Args[2:], os.Stdout, os.Stderr))
+	case "stats":
+		os.Exit(cli.Stats(os.Args[2:], os.Stdout, os.Stderr))
+	case "dash":
+		os.Exit(cli.Dash(os.Args[2:], os.Stdout, os.Stderr))
 	default:
 		fmt.Fprintf(os.Stderr, "hollow: unknown command %q\n", verb)
 		usage(os.Stderr)
@@ -43,6 +47,8 @@ usage:
 	hollow trace <name> [type]     draw the delegation path the resolver walked
 	hollow inspect <name> [type]   dump the reply octet by octet, annotated
 	hollow serve                   answer DNS on 127.0.0.1:15353, udp and tcp
+	hollow stats                   ask a running server what it has been doing
+	hollow dash                    watch a running server on a live dashboard
 
 Run "hollow <command> -h" for the flags a command accepts.
 `)

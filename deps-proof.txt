@@ -85,6 +85,16 @@ net/netip
 container/list
 hash
 hash/maphash
+math/rand/v2
+log/internal
+log
+log/slog/internal
+log/slog/internal/buffer
+log/slog
+vendor/golang.org/x/net/dns/dnsmessage
+internal/nettrace
+internal/singleflight
+net
 crypto
 crypto/internal/fips140deps/godebug
 crypto/internal/fips140
@@ -101,7 +111,6 @@ crypto/internal/fips140/check
 crypto/internal/fips140/aes
 crypto/internal/sysrand
 crypto/internal/entropy
-math/rand/v2
 crypto/internal/randutil
 crypto/internal/fips140/drbg
 crypto/internal/fips140/aes/gcm
@@ -113,15 +122,6 @@ crypto/internal/boring
 math/rand
 math/big
 crypto/rand
-vendor/golang.org/x/net/dns/dnsmessage
-internal/nettrace
-internal/singleflight
-net
-log/internal
-log
-log/slog/internal
-log/slog/internal/buffer
-log/slog
 os/signal
 text/tabwriter
 

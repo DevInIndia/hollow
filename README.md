@@ -113,6 +113,26 @@ Draw the walk instead of describing it, and read the reply octet by octet:
 ./hollow inspect --file internal/wire/testdata/example-com-a.bin
 ```
 
+Ask a running server what it has been doing:
+
+```bash
+# The control socket is opt-in. Nothing extra is bound without this flag.
+./hollow serve --control 127.0.0.1:15354
+
+# In another terminal
+./hollow stats
+./hollow stats --json | jq .cache_hits
+
+# Or watch it live. Ctrl-C to quit.
+./hollow dash
+
+# ASCII instead of box drawing, and a fixed size when the terminal will not say
+./hollow dash --ascii --width 120 --height 40
+
+# Append a frame per interval instead of redrawing, writing no escape sequences
+./hollow dash --plain --interval 5s >> dash.log
+```
+
 `--trace` writes the path to stderr and the answer to stdout, so redirecting stdout captures only records:
 
 ```
@@ -163,6 +183,8 @@ The codebase is organized into clean, focused packages:
 * `internal/blocklist/`: Hosts, domain-per-line and adblock list parsing, suffix matching and the block response modes.
 * `internal/stats/`: Counters, a recent-query ring and the event stream, none of which the query path can block on.
 * `internal/rrl/`: Response rate limiting by client network, with BIND-style slip.
+* `internal/control/`: The control socket, a loopback TCP listener speaking length-prefixed JSON, which is how a second process reads a running server.
+* `internal/tui/`: The dashboard frame builder, hand-rolled ANSI over `os.Stdout`, with no raw mode and one build tag for the Windows console.
 
 ### How resolution is kept safe
 
@@ -290,6 +312,47 @@ Statistics are collected on every query, and nothing about collecting them can m
 
 **The name counters are bounded and say when they are full.** A top-domains map that admits every name it sees is a memory exhaustion bug waiting for a random subdomain flood, which is a routine attack on a recursive resolver. Each counter shard stops admitting new names at its cap and counts the refusals instead. Refusing is O(1) where evicting the smallest would be a scan of the shard on every query during exactly the flood that has to stay cheap, and the bias runs the useful way: a genuinely popular name was admitted long before any flood started, and the one-off names a flood is made of are what a top-ten list should be leaving out anyway. When sightings have been left out, the report says so rather than presenting a partial list as complete.
 
+### Reading a server that is already running
+
+`--control` binds a second listener that a separate process reads. It is opt-in and off by default, because it is a surface that carries the addresses of clients and the names they asked for, and a feature nobody asked for should not be listening. A control socket that cannot bind is fatal, exactly as a partial DNS bind is: an operator who passed the flag asked for a socket, and a server that starts without one while reporting success is a server they will debug from the wrong end.
+
+**Loopback TCP with length-prefixed JSON, not a Unix domain socket.** Unix sockets do not exist on Windows, and this repository cross-compiles for it. Not HTTP either, which would bring a server, a router and a set of status-code decisions to a problem that is one request and a stream of records. The framing is four octets of length and then a JSON object, which is the shape DNS over TCP already uses two packages away, for the same reason: a reader has to know where a message ends before it can parse one. A length prefix is a promise about an allocation, so it is bounded before the buffer is made rather than after.
+
+A client sends one request and gets either a single snapshot or a stream. `hollow stats` takes the snapshot and exits, which composes with `watch`, with a cron line, and with a pipe into `jq`. The stream carries an event per answered query and a fresh snapshot on a timer, on one connection, which is what `hollow dash` reads.
+
+**Nothing on the query path waits for any of it.** The subscription is the same non-blocking broadcast described above, so a watcher that stops reading loses events and is eventually closed by a write deadline, rather than becoming every client's timeout. The types on the wire are defined in `internal/control` rather than reused from `internal/stats`, which deliberately knows nothing about DNS: a record type arrives as `MX` and a duration as a count of milliseconds, so that whatever is drawing a screen never has to import a DNS codec or divide by a thousand.
+
+### The dashboard, and the raw mode it does not use
+
+`hollow dash` is a separate process that attaches to the control socket:
+
+```
+┌─ hollow ───────────────────────────────────────────────── 127.0.0.1:15354  up 1m39s ─┐
+│ qps 539     cache 87.0%   blocked 21.8%   p50 0.42ms    p99 61ms                     │
+│ ▂▁▁▁▁▁▂▂▂▂▂▂▃▃▃▃▃▄▄▄▄▄▄▅▅▅▅▅▆▆▆▆▆▆▇▇▇▇▇█                                             │
+├──────────────────────────────────────────────────────┬───────────────────────────────┤
+│ LIVE                                                 │ TOP NAMES                     │
+│ 20:41:07 10.0.0.7        A     NOERROR  stale.e…et. ~│  1 cdn.example.com.      4821 │
+│ 20:41:06 2001:db8::beef  MX    SERVFAIL mail.ex…rg.  │  2 api.service.io.       3204 │
+│ 20:41:04 10.0.0.9        AAAA  blocked  ads.tra…et.  │                               │
+│ 20:41:03 10.0.0.4        A     NOERROR  cdn.exa…om. +│ TOP BLOCKED                   │
+├──────────────────────────────────────────────────────┴───────────────────────────────┤
+│ cache 84213 entries   stale 41   dropped 0   ^C quit                                 │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**There is no raw mode, and that is the design rather than a corner cut.** Reading a keypress means the `TCGETS` and `TCSETS` ioctls on Linux, `TIOCGETA` and `TIOCSETA` with different constants on macOS, and `SetConsoleMode` on Windows: three implementations and three sets of magic numbers, for a feature a dashboard does not need. This redraws on a timer and quits on Ctrl-C, which requires no terminal state on any platform, so there is no state this program can fail to put back. The one platform-specific call left is turning on ANSI processing for the Windows console, which is the only build tag in the repository.
+
+**Nothing is written that the destination cannot render.** Escape sequences going into a pipe, a file, or a console without ANSI support is the failure that looks worst and is cheapest to avoid, so a non-terminal, an unset or `dumb` `TERM`, `--plain`, or a Windows console that refuses the mode each independently switch the whole thing off rather than reducing it. In that mode a frame is appended per interval and not one escape byte is written. `NO_COLOR` is honoured whatever its value, and colour never carries meaning on its own: a blocked query says `blocked`, a cache hit carries `+` and a stale answer `~`, all of which survive into ASCII with no colour at all.
+
+**One write per frame, never a clear and redraw.** The frame is built into a buffer and written in a single call, with the cursor sent home and each line clearing its own tail. Clearing the screen first is what makes a dashboard flicker.
+
+**The rate is computed from the server's clock, not this process's.** Snapshots carry an uptime, so a dashboard that was suspended and resumed reports the average over the gap instead of inventing a spike out of its own scheduling. A reconnect resets that history, because a restarted server has an uptime that went backwards and a rate computed across the boundary describes nothing that happened.
+
+**Losing the server is a banner, not an exit.** Somebody will stop the server with the dashboard open, and the last known state stays on screen behind the banner because that is the moment those numbers are worth reading. It reconnects on a backoff, and it can be started before the server exists.
+
+Terminal size is the honest limitation. Reading it properly means `TIOCGWINSZ` or `GetConsoleScreenBufferInfo`, which is the platform problem this package exists without, so the size comes from `COLUMNS` and `LINES`, then `--width` and `--height`, then 100x30. Most shells set `COLUMNS` without exporting it, so the flags are the answer in practice, and a terminal resized while the dashboard is running is not noticed until it is restarted.
+
 ### What it measures
 
 `go test -bench . -benchmem ./internal/cache ./internal/wire`, on an 11th Gen Core i7-1165G7, go1.25.0. The cache benchmarks run under `RunParallel`, because a sequential number would hide the contention the sharding exists to prevent:
@@ -331,13 +394,16 @@ What the numbers say, which is the reason they are here rather than in a footnot
 * **0x20 protects the path, not the server at the end of it**: a randomised case pattern makes an off-path forgery expensive. It does nothing about a nameserver that is itself compromised or lying, because that server echoes the nonce correctly. It also carries no entropy at all for a name with no letters in it, and very little for a short one.
 * **Rate limiting counts responses, not amplification**: the limit is a flat rate per client network. It does not score a client's behaviour, weigh the response size against the query size, or notice that a source is asking only for the record types that amplify best. Those signals are real and BIND-like implementations use them; what is here is the mechanism that stops the traffic, without the classifier that would decide more cleverly whom to stop it for.
 * **A rate-limited client is not told which one it is**: the counters at shutdown report how many responses were held back and how many networks were tracked, but there is no per-network report and no log line per drop, for the same reason dropped packets are counted rather than logged.
+* **The dashboard cannot read the terminal size, and does not notice a resize**: getting it means an ioctl on Unix and a console call on Windows, which is the platform-specific surface this project is built to avoid, so the size is taken from `COLUMNS` and `LINES`, then from `--width` and `--height`, then from a 100x30 default. Most shells set `COLUMNS` without exporting it, so a child process usually sees nothing and the flags are the real answer. A terminal resized while the dashboard runs keeps the size it started with, since noticing would mean `SIGWINCH`, which does not exist on Windows.
+* **The dashboard has no keyboard**: no filtering, no pausing, no scrolling back through the feed. It redraws and it quits, because everything else needs raw mode, and the three platform implementations that would take are not worth a keypress on an observability surface.
+* **The live feed starts empty**: it carries what has happened since the dashboard attached, not what happened before. The server keeps a ring of recent queries, but the stream deliberately begins at the moment of subscription, so a dashboard opened on a busy server shows top-N lists that are already populated beside a feed that is not.
 * **Nameserver selection is random, not measured**: candidates are shuffled to avoid always paying the slowest server's latency, but there is no RTT tracking, so a fast server is no more likely to be chosen the second time.
 
 ## Reproducible Build Proof
 
 `hollow` builds reproducibly: the same source produces a byte-identical binary, from any directory, because `-trimpath` keeps the build path out of it.
 
-* **SHA-256, linux/amd64, go1.25.0, `CGO_ENABLED=0`**: `4cc85810b5bd081dc0bae349ee7d414424d334d07f98a6888ef5df2ebaaf9133`
+* **SHA-256, linux/amd64, go1.25.0, `CGO_ENABLED=0`**: `f78de0717237d4c419ab15df17b02e2fd7350d9f256e09019712224b37b4d9f6`
 * The hash is of the binary this commit builds and is specific to that platform and toolchain. A build for another target will differ, and so will this line after any change to `cmd/hollow` or anything it imports.
 * Verify reproducibility locally:
 

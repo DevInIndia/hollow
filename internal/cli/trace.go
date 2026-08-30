@@ -15,6 +15,7 @@ import (
 
 	"github.com/DevInIndia/hollow/internal/cache"
 	"github.com/DevInIndia/hollow/internal/resolver"
+	"github.com/DevInIndia/hollow/internal/tui"
 	"github.com/DevInIndia/hollow/internal/wire"
 )
 
@@ -151,16 +152,12 @@ func glyphs(ascii bool, w io.Writer) charset {
 	return unicodeSet
 }
 
-// isTerminal reports whether w is a character device. Anything that is not an
-// *os.File, which is every buffer a test writes into, is not.
-func isTerminal(w io.Writer) bool {
-	f, ok := w.(*os.File)
-	if !ok {
-		return false
-	}
-	info, err := f.Stat()
-	return err == nil && info.Mode()&os.ModeCharDevice != 0
-}
+// isTerminal reports whether w is a character device.
+//
+// The implementation lives in internal/tui, which needs the same answer for the
+// same reason and is where the rest of the terminal knowledge in this project
+// sits. Two copies of a six-line check is two places for it to be wrong.
+func isTerminal(w io.Writer) bool { return tui.IsTerminal(w) }
 
 // drawTrace renders the walk as a tree: a line per zone, and under it the
 // server that was asked, with what it said.

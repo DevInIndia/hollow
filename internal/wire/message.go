@@ -131,6 +131,30 @@ const (
 	RcodeRefused  uint8 = 5
 )
 
+// RcodeName renders a response code the way dig prints it.
+//
+// Here rather than beside the presentation code because there are now two
+// consumers, the CLI output and the control socket, and two switches over the
+// same six constants is one switch too many: the day a seventh is added, one of
+// them gets it.
+func RcodeName(rcode uint8) string {
+	switch rcode {
+	case RcodeSuccess:
+		return "NOERROR"
+	case RcodeFormErr:
+		return "FORMERR"
+	case RcodeServFail:
+		return "SERVFAIL"
+	case RcodeNXDomain:
+		return "NXDOMAIN"
+	case RcodeNotImp:
+		return "NOTIMP"
+	case RcodeRefused:
+		return "REFUSED"
+	}
+	return fmt.Sprintf("RCODE%d", rcode)
+}
+
 // Header is the 12-octet message header. The section counts are not stored,
 // because they are a function of the sections themselves and a Header that can
 // disagree with its own message is a bug waiting to happen.

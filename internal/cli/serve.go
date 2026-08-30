@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
 	"os/signal"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/DevInIndia/hollow/internal/blocklist"
 	"github.com/DevInIndia/hollow/internal/cache"
+	"github.com/DevInIndia/hollow/internal/control"
 	"github.com/DevInIndia/hollow/internal/resolver"
 	"github.com/DevInIndia/hollow/internal/rrl"
 	"github.com/DevInIndia/hollow/internal/server"
@@ -48,6 +50,7 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 		mixed   = fs.Bool("dns0x20", true, "randomise the case of each outgoing query name, and refuse a reply that does not echo it")
 		rate    = fs.Int("rrl", rrl.DefaultPerSecond, "responses per second to one client network before rate limiting starts; 0 disables")
 		slip    = fs.Int("rrl-slip", rrl.DefaultSlip, "answer every Nth rate-limited response truncated instead of dropping it; 0 drops them all")
+		ctl     = fs.String("control", "", "address for the control socket that hollow stats and hollow dash attach to, for example "+control.DefaultAddr)
 	)
 	var forward, block, allow stringList
 	fs.Var(&forward, "forward", "resolve by asking this server instead of walking from the root; repeatable, tried in order")
@@ -207,6 +210,22 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 		return ExitFailure
 	}
 
+	// The control socket binds here for the same reason, and its failure is
+	// fatal for the same reason a partial DNS bind is: an operator who passed
+	// --control asked for a socket, and a server that comes up without one while
+	// reporting success is a server they will spend twenty minutes debugging
+	// from the wrong end.
+	var ctlSrv *control.Server
+	var ctlLn net.Listener
+	if *ctl != "" {
+		if ctlLn, err = control.Listen(*ctl); err != nil {
+			conns.Close()
+			fmt.Fprintf(stderr, "hollow: %v\n", err)
+			return ExitFailure
+		}
+		ctlSrv = &control.Server{Collector: col, Log: log}
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -224,10 +243,34 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 	}
 	reportBlocklist(stdout, blocks, blockMode)
 	reportLimiter(stdout, *rate, *slip, exempt)
+	reportControl(stdout, ctlLn)
+
+	// A control failure after startup is logged rather than fatal, which is the
+	// opposite of how its bind failure is treated and is the right way round.
+	// Refusing to start is how an operator finds out they asked for something
+	// they did not get; taking a working DNS server down because the socket
+	// nobody is currently watching stopped accepting would be the observability
+	// making the thing worse, which is what internal/stats is arranged to avoid.
+	var ctlDone chan struct{}
+	if ctlSrv != nil {
+		ctlDone = make(chan struct{})
+		go func() {
+			defer close(ctlDone)
+			if err := ctlSrv.Serve(ctx, ctlLn); err != nil {
+				log.Error("control socket stopped", "err", err)
+			}
+		}()
+	}
 
 	if err := s.Serve(ctx, conns); err != nil {
 		fmt.Fprintf(stderr, "hollow: %v\n", err)
 		return ExitFailure
+	}
+	if ctlDone != nil {
+		// s.Serve returns nil only when the context is done, so the control
+		// server is already on its way out. Waiting keeps the lines below from
+		// racing a watcher that is still being told to go.
+		<-ctlDone
 	}
 	if store != nil {
 		// Reported at the end for the same reason the server reports dropped
@@ -242,6 +285,13 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 			limited, dropped, slipped, plural(tracked, "network", "networks"))
 	}
 	report(stdout, col.Snapshot())
+	if ctlSrv != nil {
+		// Last, because it is a fact about who was watching rather than about
+		// what was served, and it is the one line here that says nothing about
+		// DNS.
+		fmt.Fprintf(stdout, "control: %s attached over this run\n",
+			plural(int(ctlSrv.Served()), "client", "clients"))
+	}
 	fmt.Fprintln(stdout, "hollow stopped")
 	return ExitOK
 }
@@ -296,6 +346,18 @@ func reportLimiter(w io.Writer, rate, slip int, trusted []netip.Prefix) {
 	}
 	fmt.Fprintf(w, "rate limiting responses past %d a second to one client network, %s; %s exempt\n",
 		rate, how, strings.Join(names, ", "))
+}
+
+// reportControl says whether anything can watch this server, and where.
+//
+// Silent when the socket is off, unlike the rate limiter line, because off is
+// the default here and a line saying a feature nobody asked for is not running
+// is a line that trains an operator to skip the block it sits in.
+func reportControl(w io.Writer, ln net.Listener) {
+	if ln == nil {
+		return
+	}
+	fmt.Fprintf(w, "control socket on %s, for hollow stats and hollow dash\n", ln.Addr())
 }
 
 func ordinal(n int) string {

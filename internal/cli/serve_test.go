@@ -65,6 +65,12 @@ func TestServeRejectsBadArguments(t *testing.T) {
 		"a negative slip":                         {"--rrl-slip", "-2"},
 		"a trusted network that is not a network": {"--rrl-trusted", "the office"},
 		"trusted networks with no limiter":        {"--rrl", "0", "--rrl-trusted", "10.0.0.0/8"},
+
+		// A control socket that cannot bind stops the server, rather than
+		// leaving it running and reporting success while the operator waits for
+		// a dashboard that will never attach.
+		"an unbindable control address":     {"--control", "203.0.113.1:15354"},
+		"a control address that is not one": {"--control", "not an address"},
 	}
 
 	for name, args := range tests {
