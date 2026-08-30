@@ -57,6 +57,14 @@ func TestServeRejectsBadArguments(t *testing.T) {
 
 		// An allowlist with no blocklist to override does nothing at all.
 		"allow with nothing to allow past": {"--allow", "/nonexistent/allow"},
+
+		// Rate limiting takes a rate and a slip that mean something, and
+		// exempting a network from a limiter that is switched off is another
+		// pair of flags that contradict each other.
+		"a negative rate":                         {"--rrl", "-1"},
+		"a negative slip":                         {"--rrl-slip", "-2"},
+		"a trusted network that is not a network": {"--rrl-trusted", "the office"},
+		"trusted networks with no limiter":        {"--rrl", "0", "--rrl-trusted", "10.0.0.0/8"},
 	}
 
 	for name, args := range tests {
@@ -496,7 +504,7 @@ func TestParseServersTakesAddressesWithOrWithoutAPort(t *testing.T) {
 
 func TestReportModeSaysWhereAnswersComeFrom(t *testing.T) {
 	var out strings.Builder
-	reportMode(&out, nil)
+	reportMode(&out, nil, false)
 	if !strings.Contains(out.String(), "from the root") {
 		t.Errorf("iterative mode printed %q", out.String())
 	}
@@ -506,9 +514,9 @@ func TestReportModeSaysWhereAnswersComeFrom(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseServers: %v", err)
 	}
-	reportMode(&out, servers)
+	reportMode(&out, servers, true)
 	got := out.String()
-	for _, want := range []string{"1.1.1.1:53", "8.8.8.8:53", "in order", "not walked"} {
+	for _, want := range []string{"1.1.1.1:53", "8.8.8.8:53", "in order", "not walked", "randomised case"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("forwarding mode line is missing %q:\n%s", want, got)
 		}
@@ -529,5 +537,56 @@ func TestTheHandlerAcceptsAForwarder(t *testing.T) {
 	}
 	if s := col.Snapshot(); s.UpstreamErrors != 1 {
 		t.Errorf("UpstreamErrors = %d, want 1", s.UpstreamErrors)
+	}
+}
+
+func TestParsePrefixesTakesNetworksAndBareAddresses(t *testing.T) {
+	// No flag at all means the loopback default, which is what keeps a limiter
+	// that is on by default from limiting the operator's own testing.
+	got, err := parsePrefixes(nil)
+	if err != nil {
+		t.Fatalf("parsePrefixes(nil) error = %v", err)
+	}
+	if len(got) != 2 || !got[0].Contains(netip.MustParseAddr("127.0.0.1")) {
+		t.Errorf("the default exemption is %v, want loopback", got)
+	}
+
+	got, err = parsePrefixes([]string{"10.0.0.0/8", "192.0.2.7", "2001:db8::/32"})
+	if err != nil {
+		t.Fatalf("parsePrefixes() error = %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("prefixes = %d, want 3", len(got))
+	}
+	// A bare address is exempt as itself rather than as some guessed network.
+	if got[1].Bits() != 32 || !got[1].Contains(netip.MustParseAddr("192.0.2.7")) {
+		t.Errorf("a bare address became %v, want 192.0.2.7/32", got[1])
+	}
+	if got[1].Contains(netip.MustParseAddr("192.0.2.8")) {
+		t.Error("a bare address exempted its neighbour too")
+	}
+}
+
+func TestReportLimiterSaysWhatIsLimitedAndWhatIsNot(t *testing.T) {
+	var out strings.Builder
+	reportLimiter(&out, 20, 2, loopback)
+	for _, want := range []string{"20 a second", "second one answered truncated", "127.0.0.0/8", "::1/128"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("the limiter line is missing %q:\n%s", want, out.String())
+		}
+	}
+
+	out.Reset()
+	reportLimiter(&out, 0, 2, nil)
+	if !strings.Contains(out.String(), "off") {
+		t.Errorf("a disabled limiter printed %q", out.String())
+	}
+
+	// Slip off is worth saying plainly, because it is the setting that turns
+	// the limiter into an outage for a real client behind a busy network.
+	out.Reset()
+	reportLimiter(&out, 20, 0, loopback)
+	if !strings.Contains(out.String(), "0 dropped") {
+		t.Errorf("slip off printed %q", out.String())
 	}
 }

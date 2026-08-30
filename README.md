@@ -11,7 +11,8 @@ Unlike standard DNS utilities and servers, `hollow` is built from the ground up 
 * **Zero Upstream Dependency (Root Walker)**: Traditional lookups (`nslookup`, `dig`) send queries to stub resolvers (like `8.8.8.8` or system DNS). `hollow` performs genuine root-to-authoritative iterative walks starting at IANA root servers (`a.root-servers.net` to `m.root-servers.net`).
 * **Zero Third-Party Code (Standard Library Only)**: Most Go DNS software uses `github.com/miekg/dns`. `hollow` replaces it entirely with `internal/wire`, a hand-written 1,317-line codec that parses raw wire-format octets, handles domain compression pointers safely, and packs EDNS0 pseudo-records.
 * **Deterministic & Reproducible Builds**: Built with `-trimpath` and `-buildvcs=false`. Every build across any directory produces a 100% byte-identical executable verified via `make reproduce`.
-* **Integrated CLI & Server Engine**: Combines dig-style resolution formatting, structured JSON output, delegation path tracing (`--trace`), and a concurrent UDP/TCP server engine in one single binary.
+* **Integrated CLI & Server Engine**: Combines dig-style resolution formatting, structured JSON output, a delegation-path visualiser, an annotated hexdump of the raw reply, and a concurrent UDP/TCP server engine in one single binary.
+* **Shows Its Work**: `hollow trace` draws the delegation chain the resolver actually walked, instrumented rather than replayed, and `hollow inspect` accounts for every octet of a reply with the compression pointers resolved.
 
 ## Quick Start
 
@@ -88,6 +89,30 @@ If the network will not let you talk to the root servers, forward instead:
 ./hollow serve --forward 192.168.1.1 --block hosts.txt
 ```
 
+Draw the walk instead of describing it, and read the reply octet by octet:
+
+```bash
+# The delegation chain as a tree: which server was asked, out of how many, what
+# it said, how large it was, and how long it took.
+./hollow trace example.com
+
+# Cache within the one walk, so a CNAME chain reuses the delegations it found
+# instead of starting again at the root for every link.
+./hollow trace --cache www.bbc.co.uk
+
+# ASCII instead of box drawing, which also happens automatically when stdout is
+# not a terminal. --json emits the steps.
+./hollow trace --ascii example.com
+./hollow trace --json example.com
+
+# Every octet of the reply, annotated by the decoder that read it.
+./hollow inspect example.com
+./hollow inspect --server 8.8.8.8 bbc.co.uk MX
+
+# A message captured earlier, with no query sent at all.
+./hollow inspect --file internal/wire/testdata/example-com-a.bin
+```
+
 `--trace` writes the path to stderr and the answer to stdout, so redirecting stdout captures only records:
 
 ```
@@ -137,6 +162,7 @@ The codebase is organized into clean, focused packages:
 * `internal/single/`: Request coalescing, so concurrent identical queries share one resolution.
 * `internal/blocklist/`: Hosts, domain-per-line and adblock list parsing, suffix matching and the block response modes.
 * `internal/stats/`: Counters, a recent-query ring and the event stream, none of which the query path can block on.
+* `internal/rrl/`: Response rate limiting by client network, with BIND-style slip.
 
 ### How resolution is kept safe
 
@@ -147,6 +173,72 @@ The zones being walked are published by whoever owns the name, so the loop treat
 * **Bounded work.** 16 delegations, 64 queries and 8 CNAME links per resolution. Resolving a nameserver that came with no glue shares that same budget rather than starting a fresh one.
 * **No recursion requested.** `RD` is cleared on every iterative query. A server that honoured it would return an answer whose delegation path was never checked.
 * **CNAME loops** are detected by name, not just by hop count.
+
+### Seeing the walk, and seeing the octets
+
+Two verbs exist because a resolver that cannot show its work is asking to be taken on faith.
+
+`hollow trace` renders the delegation chain as a tree. It is not a replay and not a simulation: the resolver emits a step as each packet goes out, and the tree is those steps. A trace and a resolve can therefore not disagree about what happened, because there is one code path and it is instrumented rather than duplicated.
+
+```
+. (root)
++- [2801:1b8:10::b]:53                                    235ms  udp, referral, 546 B, 8 NS + 16 glue, 1 of 26 servers
+   asked as WWw.bBc.CO.Uk.
+   uk.
+   +- dns4.nic.uk. ([2401:fd80:404::1]:53)                510ms  udp, referral, 381 B, 8 NS + 8 glue, 1 of 16 servers
+      bbc.co.uk.
+      +- dns1.bbc.co.uk. ([2a00:edc0:6259:7:9::2]:53)      84ms  udp, answer, 74 B, 1 of 8 servers
+(cname, now resolving www.bbc.co.uk.pri.bbc.co.uk.)
+bbc.co.uk.
++- ddns1.bbc.co.uk. ([2607:f740:e04e:4::1]:53)            245ms  udp, answer, 115 B, 1 of 8 servers
+```
+
+Four things in there are deliberate. **The server is named as well as addressed**, from the glue the parent zone published, so the line repeats what a zone said rather than looking anything up. **"1 of 26 servers" is the selection**, and it is there because choosing among a zone's nameservers and always taking the first look identical in a list of exchanges. **A nameserver with no glue gets its own indented sub-tree**, marked with why it was needed, because that lookup is the case that separates an iterative resolver from something that only follows glue. **A CNAME hop returns to the level it started at** rather than nesting deeper, since it is a new walk for a new name rather than a step in the old one. With `--cache` the second link starts at the deepest zone already known, which is the cache doing its other job, in the picture.
+
+`hollow inspect` dumps the reply with every field named by the decoder that read it:
+
+```
+000c  07 65 78 61 6d 70 6c 65  QNAME example.com. = "example" "com"
+0014  03 63 6f 6d 00
+0019  00 01                    QTYPE A (1)
+001d  c0 0c                    NAME example.com. = pointer to 0x000c
+0027  00 04                    RDLENGTH 4
+0029  5d b8 d8 22              RDATA address 93.184.216.34
+```
+
+`wire.Annotate` walks the message with the same decoder the resolver uses and records a span per field, so the annotation is a record of what the parser did rather than a second opinion about what the bytes mean. The spans are contiguous and cover the whole buffer, which a test asserts against the captured fixtures: a dump with a gap in it is claiming the parser read something it did not. Compression pointers are resolved to their target offset and the name they expand to, including the partial case that a real MX answer produces, where one label is literal and the rest is a pointer: `RDATA exchange cluster1.eu.messagelabs.com. = "cluster1" + pointer to 0x0033`.
+
+### Resisting a forged answer
+
+An off-path attacker guessing a reply has to match everything hollow checks before the answer is accepted. Three of those are unpredictable, and they multiply.
+
+**The transaction ID** is 16 bits from `crypto/rand`, never `math/rand`, because a predictable sequence gives the whole thing away.
+
+**The source port** is another 15 bits or so, and it comes from dialling the UDP socket rather than opening it. A connected socket makes the kernel drop datagrams from any other address and port before this process sees them, which is a filter no amount of checking in userspace can match for cost. It is a fresh socket per query, so consecutive queries leave from different ports, which is asserted by a test rather than assumed of the kernel.
+
+**The case of the name** is one bit per letter, which is DNS 0x20. Names match case-insensitively while conforming servers echo the question verbatim, so a randomised case pattern is a nonce that an attacker cannot see and has to guess. `www.example.com` carries 13 letters, so:
+
+| Name | ID | Port | 0x20 | Total |
+|---|---|---|---|---|
+| `a.io` | 16 | 15 | 3 | 34 bits |
+| `example.com` | 16 | 15 | 10 | 41 bits |
+| `www.example.com` | 16 | 15 | 13 | 44 bits |
+| `cdn.assets.example.co.uk` | 16 | 15 | 20 | 51 bits |
+
+The short name is the weak case and stays weak. That is a property of the mechanism, not a gap in this implementation, and it is why the other two matter.
+
+Four details decide whether 0x20 works or merely looks like it does:
+
+* **Only ASCII letters move.** A digit, a hyphen or a dot that changed would make the question fail to match on the way back, and a conforming server would be blamed for it. A letter never appears inside an escape sequence, because the encoder escapes only `.`, `\` and unprintable octets, and those take the three-digit form.
+* **UDP only.** Answering a TCP query means completing a handshake with our address, which an off-path attacker cannot do. Randomising there would prove nothing and would read as if the mechanism had not been understood.
+* **A server that does not preserve case is remembered, not refused.** Real ones exist. Such a server is asked once more without randomisation and skipped thereafter, which costs one extra timeout for that server, once. The retry waits out the deadline first rather than treating one wrong-case datagram as permission to stop randomising, so switching the defence off requires stopping the genuine answer from arriving at all, not merely racing it.
+* **The nonce never leaves the resolver.** It comes back in more than the question section: a referral for `com` is owned by whatever case `com` was sent in, and anything compressed against the question inherits it pointer by pointer. Every name matching a whole-label suffix of what was sent is rewritten back before the answer is cached or returned, so a client that asked about `example.com` is never shown records owned by `eXaMPle.CoM`.
+
+**Response rate limiting** is the other half, and it defends somebody else rather than this server. A DNS query is small and an answer is large, so a resolver on the internet is a way to turn a 60-octet packet carrying a forged source address into a 500-octet packet aimed at whoever that address belongs to. `--rrl` bounds how many responses go to one client network per second: a /24 for IPv4, a /56 for IPv6, because an attacker with a /64 of IPv6 has more addresses than this program has memory.
+
+The part that makes it usable rather than an outage is **slip**. Every second response over the limit is answered truncated instead of dropped, which costs a few dozen octets and no amplification. A real client reads TC and asks again over TCP, which succeeds because TCP is exempt; a spoofed source cannot complete the handshake and gets nothing. Without slip, a legitimate client behind a busy network simply stops being served with no way to recover, so `--rrl-slip 0` is available and is not the default.
+
+The rest of the reasoning, in brief: the check runs **before** resolution, so a response that will not be sent costs no walk from the root. The tracking table is **bounded and LRU**, because a table that grows with the number of source addresses an attacker can invent is the defence becoming the vulnerability; under a flood of forged sources the network actually being answered is touched on every packet and stays, while the forgeries are what get evicted. **Loopback is exempt by default**, since the default listen address is loopback and the first thing this would otherwise limit is the operator testing their own server. A network seen for the first time gets one second's allowance rather than the window's worth, so inventing a new source network is not a way to collect free responses.
 
 ### Forwarding, and what it gives up
 
@@ -235,14 +327,17 @@ What the numbers say, which is the reason they are here rather than in a footnot
 * **A forwarded answer is trusted absolutely**: under `--forward` there is no delegation path, so none of the checks that make the iterative walk safe are available. `hollow` returns what the forwarder said. Choosing a forwarder is choosing whom to believe, and that is the entire security model of the mode.
 * **Forwarders are not health checked or timed**: they are tried in the order written, every time, and a server that is merely slow is used ahead of a fast one below it for as long as it keeps answering. Failover happens per query, on failure, with no memory of it: a dead first forwarder costs every query one timeout rather than being marked down.
 * **No per-client accounting**: the worker pool, the connection cap and the query budget are all global. A single client can occupy the whole server, and there is no rate limiting.
-* **DNSSEC**: EDNS0 is implemented and queries advertise a 1232-octet payload size. The DO bit is decoded and displayed when a server sets it, but there is no flag to request DNSSEC records and no validation of them. A forged delegation from a compromised parent zone would not be detected.
+* **DNSSEC is not implemented, and was not attempted**: EDNS0 is there and queries advertise a 1232-octet payload size, and the DO bit is decoded and displayed when a server sets it, but there is no flag to request DNSSEC records and nothing validates them. A forged delegation from a compromised parent zone would not be detected. This is a deliberate omission rather than an unfinished feature: validation means a chain of trust from the root, NSEC and NSEC3 denial of existence, several signature algorithms and their key rollovers, and getting it half right is worse than not claiming it, because a resolver that reports AD on evidence it did not check is lying to everything downstream. The defences that are here, 0x20 and source port randomisation, raise the cost of forging an answer; they do not prove one is genuine, and nothing here claims otherwise.
+* **0x20 protects the path, not the server at the end of it**: a randomised case pattern makes an off-path forgery expensive. It does nothing about a nameserver that is itself compromised or lying, because that server echoes the nonce correctly. It also carries no entropy at all for a name with no letters in it, and very little for a short one.
+* **Rate limiting counts responses, not amplification**: the limit is a flat rate per client network. It does not score a client's behaviour, weigh the response size against the query size, or notice that a source is asking only for the record types that amplify best. Those signals are real and BIND-like implementations use them; what is here is the mechanism that stops the traffic, without the classifier that would decide more cleverly whom to stop it for.
+* **A rate-limited client is not told which one it is**: the counters at shutdown report how many responses were held back and how many networks were tracked, but there is no per-network report and no log line per drop, for the same reason dropped packets are counted rather than logged.
 * **Nameserver selection is random, not measured**: candidates are shuffled to avoid always paying the slowest server's latency, but there is no RTT tracking, so a fast server is no more likely to be chosen the second time.
 
 ## Reproducible Build Proof
 
 `hollow` builds reproducibly: the same source produces a byte-identical binary, from any directory, because `-trimpath` keeps the build path out of it.
 
-* **SHA-256, linux/amd64, go1.25.0, `CGO_ENABLED=0`**: `8eeeb38f8ade952920cd766078bbdb89c3b3ed5c0e3bbf235470951e83ef54d7`
+* **SHA-256, linux/amd64, go1.25.0, `CGO_ENABLED=0`**: `4cc85810b5bd081dc0bae349ee7d414424d334d07f98a6888ef5df2ebaaf9133`
 * The hash is of the binary this commit builds and is specific to that platform and toolchain. A build for another target will differ, and so will this line after any change to `cmd/hollow` or anything it imports.
 * Verify reproducibility locally:
 
@@ -257,7 +352,7 @@ The published hash is not a promise, it is a gate. `make verify` reads the SHA-2
 **Bonuses claimed.** Three, each with evidence that can be rerun rather than taken on faith:
 
 * **Reproducible Build (+5).** `make reproduce` builds twice and compares; `make verify` gates the hash published above against a fresh build.
-* **STDLIB Log (+3).** [STDLIB.md](STDLIB.md) carries 32 substitutions against a required 10, each recording what the substitution actually cost.
+* **STDLIB Log (+3).** [STDLIB.md](STDLIB.md) carries 37 substitutions against a required 10, each recording what the substitution actually cost.
 * **Package Killer (+3).** `internal/wire` replaces `github.com/miekg/dns`: a complete DNS codec with name compression, EDNS0, nine record types and RFC 3597 handling of unknown ones, at 1,317 lines with a fuzz target over `Unpack`.
 
 Single File is not attempted.

@@ -21,6 +21,10 @@ func main() {
 		usage(os.Stdout)
 	case "resolve":
 		os.Exit(cli.Resolve(os.Args[2:], os.Stdout, os.Stderr))
+	case "trace":
+		os.Exit(cli.Trace(os.Args[2:], os.Stdout, os.Stderr))
+	case "inspect":
+		os.Exit(cli.Inspect(os.Args[2:], os.Stdout, os.Stderr))
 	case "serve":
 		os.Exit(cli.Serve(os.Args[2:], os.Stdout, os.Stderr))
 	default:
@@ -36,6 +40,8 @@ func usage(w io.Writer) {
 usage:
 
 	hollow resolve <name> [type]   resolve a name from the root servers
+	hollow trace <name> [type]     draw the delegation path the resolver walked
+	hollow inspect <name> [type]   dump the reply octet by octet, annotated
 	hollow serve                   answer DNS on 127.0.0.1:15353, udp and tcp
 
 Run "hollow <command> -h" for the flags a command accepts.

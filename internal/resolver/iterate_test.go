@@ -520,6 +520,88 @@ func TestDelegationResolvesMissingGlue(t *testing.T) {
 	}
 }
 
+// The lookup of a nameserver's address is part of the resolution that needed it,
+// not a separate walk, and a trace has to be able to say so. Nested carries that
+// depth, which is what lets the renderer indent the sub-tree.
+func TestTraceMarksTheNestedLookupOfANameserver(t *testing.T) {
+	zones := map[netip.Addr]zoneFunc{
+		netip.MustParseAddr("127.0.0.1"): func(q wire.Question) *wire.Message {
+			if q.Name.Within("net.") {
+				return referral("net.", "b.gtld-servers.test.", "127.0.0.4")
+			}
+			return referral("com.", "a.gtld-servers.test.", "127.0.0.2")
+		},
+		netip.MustParseAddr("127.0.0.2"): func(q wire.Question) *wire.Message {
+			return referral("example.com.", "ns.hoster.net.", "")
+		},
+		netip.MustParseAddr("127.0.0.4"): func(q wire.Question) *wire.Message {
+			return answerMsg(aRR("ns.hoster.net.", "127.0.0.3"))
+		},
+		netip.MustParseAddr("127.0.0.3"): func(q wire.Question) *wire.Message {
+			return answerMsg(aRR("example.com.", "93.184.216.34"))
+		},
+	}
+	r := testResolver(t, zones)
+	var steps []Step
+	r.Trace = func(s Step) { steps = append(steps, s) }
+
+	mustResolve(t, r, "example.com.", wire.TypeA)
+
+	// Root and com belong to the outer walk. The two that resolve ns.hoster.test
+	// are inside it. The final answer is back out again.
+	want := []struct {
+		zone   wire.Name
+		nested int
+	}{
+		{".", 0},
+		{"com.", 0},
+		{".", 1},
+		{"net.", 1},
+		{"example.com.", 0},
+	}
+	if len(steps) != len(want) {
+		t.Fatalf("trace has %d steps, want %d", len(steps), len(want))
+	}
+	for i, w := range want {
+		if steps[i].Zone != w.zone || steps[i].Nested != w.nested {
+			t.Errorf("step %d = %q nested %d, want %q nested %d",
+				i, steps[i].Zone, steps[i].Nested, w.zone, w.nested)
+		}
+	}
+}
+
+// How many servers were available is the difference between choosing one and
+// taking the only one there was, and it is not visible in the exchange itself.
+func TestTraceCountsTheServersItChoseFrom(t *testing.T) {
+	zones := threeZones()
+	zones[netip.MustParseAddr("127.0.0.2")] = func(q wire.Question) *wire.Message {
+		m := &wire.Message{Authority: []wire.RR{
+			nsRR("example.com.", "ns1.example.com."),
+			nsRR("example.com.", "ns2.example.com."),
+		}, Additional: []wire.RR{
+			aRR("ns1.example.com.", "127.0.0.3"),
+			aRR("ns2.example.com.", "127.0.0.3"),
+		}}
+		return m
+	}
+	r := testResolver(t, zones)
+	var steps []Step
+	r.Trace = func(s Step) { steps = append(steps, s) }
+
+	mustResolve(t, r, "example.com.", wire.TypeA)
+
+	last := steps[len(steps)-1]
+	if last.Zone != "example.com." || last.Candidates != 2 {
+		t.Errorf("last step = %q with %d candidates, want example.com. with 2",
+			last.Zone, last.Candidates)
+	}
+	// The root is asked with the whole hint list behind it, which the test
+	// resolver sets to one address.
+	if steps[0].Candidates != 1 {
+		t.Errorf("root step candidates = %d, want 1", steps[0].Candidates)
+	}
+}
+
 // A nameserver inside the zone it serves, with no glue, is a broken delegation:
 // finding its address would mean asking it. There is nothing to chase, and the
 // resolver must say so rather than recursing until the budget runs out.

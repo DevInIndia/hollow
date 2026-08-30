@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/DevInIndia/hollow/internal/rrl"
 	"github.com/DevInIndia/hollow/internal/wire"
 )
 
@@ -123,6 +124,18 @@ type Server struct {
 
 	// Log receives operational events. Nil means slog.Default.
 	Log *slog.Logger
+
+	// Limiter, when set, bounds how many responses go to one client network.
+	// Nil disables it and is the zero value.
+	//
+	// It lives here rather than in the handler because it is a property of the
+	// transport rather than of resolution: what it needs to know is that this
+	// query arrived over UDP, where the source address is a claim rather than a
+	// fact, and the handler is deliberately not told which transport it is
+	// answering on. TCP is exempt for the same reason, and the exemption is the
+	// mechanism rather than a shortcut: completing a handshake proves the
+	// source address is real.
+	Limiter *rrl.Limiter
 
 	// pool holds read buffers. One 4096-octet buffer per packet in flight, not
 	// per packet received, which is the difference between steady memory under
@@ -283,6 +296,18 @@ func (s *Server) answer(ctx context.Context, raw []byte, from netip.Addr, overTC
 		return nil
 	}
 
+	// Rate limiting decides before the query is resolved, not after. An answer
+	// that will not be sent is not worth a walk from the root, and the work
+	// saved is the second half of what this defends against.
+	if !overTCP {
+		switch s.Limiter.Allow(from) {
+		case rrl.Drop:
+			return nil
+		case rrl.Truncate:
+			return s.encode(truncated(query), minUDPSize)
+		}
+	}
+
 	reply := s.Handler.ServeDNS(ctx, query, from)
 	if reply == nil {
 		return nil
@@ -368,6 +393,25 @@ func (s *Server) servFail(m *wire.Message) *wire.Message {
 
 // formErr builds the reply to a message that could not be decoded. It echoes
 // nothing but the transaction ID, since nothing else was understood.
+// truncated is the slip response: a header with TC set, the question echoed,
+// and nothing else. A real client reads it as "ask again over TCP" and does,
+// which succeeds because TCP is exempt from the limit. A spoofed source cannot
+// complete the handshake, so this costs an attacker a connection they cannot
+// open and costs their victim nothing but a few dozen octets.
+func truncated(query *wire.Message) *wire.Message {
+	return &wire.Message{
+		Header: wire.Header{
+			ID:                 query.Header.ID,
+			Response:           true,
+			Opcode:             query.Header.Opcode,
+			Truncated:          true,
+			RecursionDesired:   query.Header.RecursionDesired,
+			RecursionAvailable: true,
+		},
+		Questions: query.Questions,
+	}
+}
+
 func formErr(id uint16) *wire.Message {
 	return &wire.Message{
 		Header: wire.Header{

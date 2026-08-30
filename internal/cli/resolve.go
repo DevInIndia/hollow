@@ -38,6 +38,7 @@ func Resolve(args []string, stdout, stderr io.Writer) int {
 		asJSON  = fs.Bool("json", false, "output reply as JSON")
 		hints   = fs.String("hints", "", "root hints in named.root format; default is the compiled-in list")
 		trace   = fs.Bool("trace", false, "show the delegation path as it is walked")
+		mixed   = fs.Bool("dns0x20", true, "randomise the case of the query name, and refuse a reply that does not echo it")
 	)
 	fs.Usage = func() {
 		fmt.Fprint(stderr, "usage: hollow resolve [flags] <name> [type]\n\nflags:\n")
@@ -81,6 +82,9 @@ func Resolve(args []string, stdout, stderr io.Writer) int {
 	tr := resolver.Transport{
 		Timeout:  *timeout,
 		ForceTCP: *useTCP,
+	}
+	if *mixed {
+		tr.Case = resolver.NewCasing()
 	}
 	q := wire.Question{Name: name, Type: qtype, Class: wire.ClassIN}
 

@@ -17,6 +17,7 @@ import (
 	"github.com/DevInIndia/hollow/internal/blocklist"
 	"github.com/DevInIndia/hollow/internal/cache"
 	"github.com/DevInIndia/hollow/internal/resolver"
+	"github.com/DevInIndia/hollow/internal/rrl"
 	"github.com/DevInIndia/hollow/internal/server"
 	"github.com/DevInIndia/hollow/internal/single"
 	"github.com/DevInIndia/hollow/internal/stats"
@@ -44,11 +45,16 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 		size    = fs.Int("cache-size", cache.DefaultEntries, "answers to hold in the cache; 0 disables caching")
 		stale   = fs.Duration("serve-stale", 0, "how long past expiry an answer may still be served when resolution fails; 0 disables")
 		mode    = fs.String("block-mode", "nxdomain", "how a blocked name is answered: nxdomain, null or nodata")
+		mixed   = fs.Bool("dns0x20", true, "randomise the case of each outgoing query name, and refuse a reply that does not echo it")
+		rate    = fs.Int("rrl", rrl.DefaultPerSecond, "responses per second to one client network before rate limiting starts; 0 disables")
+		slip    = fs.Int("rrl-slip", rrl.DefaultSlip, "answer every Nth rate-limited response truncated instead of dropping it; 0 drops them all")
 	)
 	var forward, block, allow stringList
 	fs.Var(&forward, "forward", "resolve by asking this server instead of walking from the root; repeatable, tried in order")
 	fs.Var(&block, "block", "blocklist file in hosts, domain-per-line or adblock format; repeatable")
 	fs.Var(&allow, "allow", "allowlist file in the same formats, overriding every block; repeatable")
+	var trusted stringList
+	fs.Var(&trusted, "rrl-trusted", "network exempt from rate limiting; repeatable, and replaces the loopback default")
 	fs.Usage = func() {
 		fmt.Fprint(stderr, "usage: hollow serve [flags]\n\nflags:\n")
 		fs.PrintDefaults()
@@ -86,6 +92,23 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 	forwarders, err := parseServers(forward)
 	if err != nil {
 		fmt.Fprintf(stderr, "hollow: %v\n", err)
+		return ExitFailure
+	}
+	if *rate < 0 {
+		fmt.Fprintf(stderr, "hollow: --rrl %d, want zero or more\n", *rate)
+		return ExitFailure
+	}
+	if *slip < 0 {
+		fmt.Fprintf(stderr, "hollow: --rrl-slip %d, want zero or more\n", *slip)
+		return ExitFailure
+	}
+	exempt, err := parsePrefixes(trusted)
+	if err != nil {
+		fmt.Fprintf(stderr, "hollow: %v\n", err)
+		return ExitFailure
+	}
+	if len(trusted) > 0 && *rate == 0 {
+		fmt.Fprintln(stderr, "hollow: --rrl-trusted exempts networks from rate limiting, but --rrl is 0")
 		return ExitFailure
 	}
 	blockMode, err := blocklist.ParseMode(*mode)
@@ -132,6 +155,12 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 	// re-shuffling a fresh copy of the roots on every packet.
 	var answer answerer
 	transport := resolver.Transport{Timeout: resolver.DefaultTimeout}
+	if *mixed {
+		// One Casing for the process. Which servers do not preserve case is
+		// learned once and shared by every worker, rather than each of them
+		// paying the timeout to find out for itself.
+		transport.Case = resolver.NewCasing()
+	}
 	if len(forwarders) > 0 {
 		answer = &resolver.Forwarder{Transport: transport, Servers: forwarders, Cache: store}
 	} else {
@@ -155,11 +184,19 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 		col.CacheEntries = store.Len
 	}
 
+	// Off is a nil limiter rather than a limiter that permits everything, so
+	// the whole mechanism costs one nil check per query when it is not in use.
+	var limiter *rrl.Limiter
+	if *rate > 0 {
+		limiter = rrl.New(rrl.Config{PerSecond: *rate, Slip: *slip, Trusted: exempt})
+	}
+
 	s := &server.Server{
 		Handler: &recursor{resolver: answer, log: log, stats: col, blocks: blocks, blockMode: blockMode},
 		Workers: *workers,
 		Timeout: *timeout,
 		Log:     log,
+		Limiter: limiter,
 	}
 
 	// Bound before the signal handler is installed, so a bind failure reports
@@ -174,7 +211,7 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 
 	fmt.Fprintf(stdout, "hollow listening on %s, udp and tcp\n", conns.Addr())
-	reportMode(stdout, forwarders)
+	reportMode(stdout, forwarders, *mixed)
 	switch {
 	case store == nil && len(forwarders) > 0:
 		fmt.Fprintln(stdout, "cache disabled, every query is forwarded")
@@ -186,6 +223,7 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "cache holding %d answers\n", *size)
 	}
 	reportBlocklist(stdout, blocks, blockMode)
+	reportLimiter(stdout, *rate, *slip, exempt)
 
 	if err := s.Serve(ctx, conns); err != nil {
 		fmt.Fprintf(stderr, "hollow: %v\n", err)
@@ -199,9 +237,77 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "cache: %d hits, %d misses, %d served stale, %d entries, %d evicted\n",
 			st.Hits, st.Misses, st.Stale, st.Entries, st.Evictions)
 	}
+	if limited, dropped, slipped, _, _, tracked := limiter.Stats(); limited > 0 {
+		fmt.Fprintf(stdout, "rate limiting: %d responses held back, %d dropped, %d answered truncated, %s tracked\n",
+			limited, dropped, slipped, plural(tracked, "network", "networks"))
+	}
 	report(stdout, col.Snapshot())
 	fmt.Fprintln(stdout, "hollow stopped")
 	return ExitOK
+}
+
+// loopback is exempt from rate limiting unless the operator names other
+// networks instead.
+//
+// The default listen address is 127.0.0.1, so without this the first thing rate
+// limiting would ever limit is the operator testing their own server, and the
+// first impression of the feature would be that it is broken. A client that can
+// reach a loopback listener is already on the machine.
+var loopback = []netip.Prefix{
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("::1/128"),
+}
+
+// parsePrefixes reads the --rrl-trusted networks. A bare address is taken as
+// itself, so an operator can name one host without working out the mask.
+func parsePrefixes(list []string) ([]netip.Prefix, error) {
+	if len(list) == 0 {
+		return loopback, nil
+	}
+	out := make([]netip.Prefix, 0, len(list))
+	for _, s := range list {
+		if p, err := netip.ParsePrefix(s); err == nil {
+			out = append(out, p.Masked())
+			continue
+		}
+		a, err := netip.ParseAddr(s)
+		if err != nil {
+			return nil, fmt.Errorf("--rrl-trusted %q is neither a network nor an address", s)
+		}
+		out = append(out, netip.PrefixFrom(a, a.BitLen()))
+	}
+	return out, nil
+}
+
+// reportLimiter says whether responses are being rate limited, and to whom they
+// are not.
+func reportLimiter(w io.Writer, rate, slip int, trusted []netip.Prefix) {
+	if rate == 0 {
+		fmt.Fprintln(w, "response rate limiting off, every query that resolves is answered")
+		return
+	}
+	how := fmt.Sprintf("%d dropped", slip)
+	if slip > 0 {
+		how = fmt.Sprintf("every %s answered truncated so a real client retries over tcp", ordinal(slip))
+	}
+	names := make([]string, len(trusted))
+	for i, p := range trusted {
+		names[i] = p.String()
+	}
+	fmt.Fprintf(w, "rate limiting responses past %d a second to one client network, %s; %s exempt\n",
+		rate, how, strings.Join(names, ", "))
+}
+
+func ordinal(n int) string {
+	switch n {
+	case 1:
+		return "one"
+	case 2:
+		return "second one"
+	case 3:
+		return "third one"
+	}
+	return fmt.Sprintf("%dth one", n)
 }
 
 // stringList collects a flag given more than once, which is how --block and
@@ -250,7 +356,12 @@ func parseServers(list []string) ([]netip.AddrPort, error) {
 // that a person cannot infer from watching it answer. Both modes return the
 // same answers to the same queries; only the trust model differs, and that is
 // exactly the sort of thing that should not be silent.
-func reportMode(w io.Writer, forwarders []netip.AddrPort) {
+func reportMode(w io.Writer, forwarders []netip.AddrPort, mixedCase bool) {
+	defer func() {
+		if mixedCase {
+			fmt.Fprintln(w, "query names go out with randomised case, and a reply that does not echo it is refused")
+		}
+	}()
 	if len(forwarders) == 0 {
 		fmt.Fprintln(w, "resolving iteratively from the root")
 		return

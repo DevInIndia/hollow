@@ -73,7 +73,24 @@ type Step struct {
 	Kind   Kind
 	Err    error // set when Kind is KindFailure
 	Reply  *Reply
+
+	// Candidates is how many servers were known for Zone when this one was
+	// picked out of them. It is here because the number is the difference
+	// between a resolver that selects a nameserver and one that always takes
+	// the first, and that difference is invisible in a list of exchanges.
+	Candidates int
+
+	// Nested is how deep inside a sub-resolution this exchange is: zero for the
+	// question the caller asked, one for a nameserver whose address had to be
+	// looked up because a referral arrived without glue, and so on. Those
+	// exchanges share the outer resolution's budget, so they belong to it
+	// rather than reading as a separate walk.
+	Nested int
 }
+
+// Cached reports that this step was answered out of the cache and cost no
+// packet. Server is the zero value in that case, because nobody was asked.
+func (s Step) Cached() bool { return s.Reply != nil && s.Reply.Protocol == ProtocolCache }
 
 // Result is a completed resolution.
 type Result struct {
@@ -227,6 +244,11 @@ type session struct {
 
 	queries   int
 	resolving map[wire.Name]bool
+
+	// nested is the current sub-resolution depth, carried into every Step so a
+	// trace can nest the lookup of a nameserver's address under the referral
+	// that needed it.
+	nested int
 }
 
 // iterate answers one question, from the cache if it can and by walking
@@ -239,10 +261,11 @@ func (s *session) iterate(ctx context.Context, q wire.Question) (*Reply, error) 
 	if s.r.Cache != nil {
 		if msg, ok := s.r.Cache.Answer(q); ok {
 			rep := &Reply{Msg: msg, Protocol: ProtocolCache}
-			// Traced with a zero Server, because nobody was asked. A trace that
-			// invented an address here would be describing a packet that was
-			// never sent.
-			s.trace(Step{Zone: wire.Root, Query: q, Kind: classify(msg, q), Reply: rep})
+			// Traced with a zero Server and no zone, because nobody was asked
+			// and no zone was walked. A trace that invented either here would be
+			// describing a packet that was never sent. Step.Cached is how a
+			// renderer tells this apart from an exchange.
+			s.trace(Step{Query: q, Kind: classify(msg, q), Reply: rep})
 			return rep, nil
 		}
 	}
@@ -383,12 +406,12 @@ func (s *session) ask(ctx context.Context, servers []netip.AddrPort, zone wire.N
 				return nil, err
 			}
 			last = err
-			s.trace(Step{Zone: zone, Server: server, Query: q, Kind: KindFailure, Err: err})
+			s.trace(Step{Zone: zone, Server: server, Query: q, Kind: KindFailure, Err: err, Candidates: len(servers)})
 			continue
 		}
 
 		kind := classify(reply.Msg, q)
-		s.trace(Step{Zone: zone, Server: server, Query: q, Kind: kind, Reply: reply})
+		s.trace(Step{Zone: zone, Server: server, Query: q, Kind: kind, Reply: reply, Candidates: len(servers)})
 		if kind == KindFailure {
 			last = fmt.Errorf("%v answered rcode %d", server, reply.Msg.Header.Rcode)
 			continue
@@ -544,6 +567,9 @@ func (s *session) delegation(ctx context.Context, msg *wire.Message, zone wire.N
 // addresses resolves a nameserver's name, sharing the budget of the resolution
 // that needs it.
 func (s *session) addresses(ctx context.Context, host wire.Name) ([]netip.Addr, error) {
+	s.nested++
+	defer func() { s.nested-- }()
+
 	rep, err := s.iterate(ctx, wire.Question{Name: host, Type: wire.TypeA, Class: wire.ClassIN})
 	if err != nil {
 		return nil, err
@@ -606,6 +632,7 @@ func split(addrs []netip.Addr, port uint16, v4, v6 []netip.AddrPort) ([]netip.Ad
 
 func (s *session) trace(st Step) {
 	if s.r.Trace != nil {
+		st.Nested = s.nested
 		s.r.Trace(st)
 	}
 }

@@ -10,9 +10,11 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/DevInIndia/hollow/internal/rrl"
 	"github.com/DevInIndia/hollow/internal/wire"
 )
 
@@ -680,5 +682,96 @@ func TestClientAddrOnAnUnknownAddressType(t *testing.T) {
 	}
 	if got := clientAddr(nil); got.IsValid() {
 		t.Errorf("clientAddr(nil) = %v, want the zero Addr", got)
+	}
+}
+
+// Rate limiting runs in front of the handler, so an over-limit query is never
+// resolved at all. This asserts both halves: the client gets silence, and the
+// handler was not called.
+func TestRateLimitedQueriesAreNotEvenResolved(t *testing.T) {
+	var served atomic.Int64
+	handler := HandlerFunc(func(_ context.Context, q *wire.Message, _ netip.Addr) *wire.Message {
+		served.Add(1)
+		return answerA("192.0.2.1").ServeDNS(context.Background(), q, netip.Addr{})
+	})
+	addr := serve(t, &Server{
+		Handler: handler,
+		// One response a second with a one-second window: the first query is
+		// answered and everything after it is over the limit. Slip off, so
+		// over-limit means silence and the read below has one meaning.
+		Limiter: rrl.New(rrl.Config{PerSecond: 1, Window: time.Second, Slip: 0}),
+	})
+
+	if reply := askUDP(t, addr, query(t, "example.com.", wire.TypeA), 0); len(reply.Answers) != 1 {
+		t.Fatalf("the first query got %d answers, want 1", len(reply.Answers))
+	}
+
+	raw, err := query(t, "example.com.", wire.TypeA).Pack()
+	if err != nil {
+		t.Fatalf("packing: %v", err)
+	}
+	conn := dialUDP(t, addr)
+	if _, err := conn.Write(raw); err != nil {
+		t.Fatalf("writing: %v", err)
+	}
+	conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if n, err := conn.Read(make([]byte, 512)); err == nil {
+		t.Errorf("an over-limit query got %d octets back, want silence", n)
+	}
+
+	if got := served.Load(); got != 1 {
+		t.Errorf("the handler ran %d times, want 1: a dropped response should cost no resolution", got)
+	}
+}
+
+// Slip is what makes rate limiting usable rather than an outage for the
+// server's own clients: an over-limit response comes back truncated, and the
+// client that retries over TCP is served, because TCP is exempt.
+func TestASlippedResponseSendsTheClientToTCPAndTCPAnswers(t *testing.T) {
+	addr := serve(t, &Server{
+		Handler: answerA("192.0.2.1"),
+		Limiter: rrl.New(rrl.Config{PerSecond: 1, Window: time.Second, Slip: 1}),
+	})
+
+	askUDP(t, addr, query(t, "example.com.", wire.TypeA), 0) // spends the allowance
+
+	slipped := askUDP(t, addr, query(t, "example.com.", wire.TypeA), 0)
+	if !slipped.Header.Truncated {
+		t.Fatal("the over-limit reply came back without TC set, so nothing tells the client to retry")
+	}
+	if len(slipped.Answers) != 0 {
+		t.Errorf("a slipped reply carries %d answers, want none: the point is that it is small", len(slipped.Answers))
+	}
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dialing tcp: %v", err)
+	}
+	defer conn.Close()
+	if reply := exchangeTCP(t, conn, query(t, "example.com.", wire.TypeA)); len(reply.Answers) != 1 {
+		t.Errorf("the tcp retry got %d answers, want 1: tcp must be exempt or slip is a dead end", len(reply.Answers))
+	}
+}
+
+// TCP is exempt outright. Completing a handshake proves the source address is
+// real, which is the one thing a reflection attack cannot do.
+func TestTCPIsExemptFromRateLimiting(t *testing.T) {
+	addr := serve(t, &Server{
+		Handler: answerA("192.0.2.1"),
+		Limiter: rrl.New(rrl.Config{PerSecond: 1, Window: time.Second, Slip: 0}),
+	})
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dialing tcp: %v", err)
+	}
+	defer conn.Close()
+
+	for i := range 20 {
+		q := query(t, "example.com.", wire.TypeA)
+		q.Header.ID = uint16(2000 + i)
+		if reply := exchangeTCP(t, conn, q); len(reply.Answers) != 1 {
+			t.Fatalf("tcp query %d got %d answers, want 1", i, len(reply.Answers))
+		}
 	}
 }

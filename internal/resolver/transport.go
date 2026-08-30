@@ -63,6 +63,25 @@ type Transport struct {
 	// ForceTCP skips the UDP attempt. TCP is otherwise reached only by falling
 	// back from a truncated reply.
 	ForceTCP bool
+
+	// Case, when set, randomises the case of each outgoing UDP query name and
+	// refuses a reply that does not echo it exactly, which is the DNS 0x20
+	// defence. Nil disables it and is the zero value, so a Transport built for
+	// one exchange is unchanged.
+	//
+	// It is a pointer because it is state that has to outlive one exchange: a
+	// server found not to preserve case is remembered, and every copy of this
+	// Transport shares that knowledge.
+	Case *Casing
+
+	// KeepWire copies the octets of each reply into Reply.Wire, for a caller
+	// that wants to show the message as it arrived rather than as it decoded.
+	//
+	// Off by default because the server would otherwise hold a copy of every
+	// reply it ever received for as long as anything referenced it, which is a
+	// per-query allocation and a retention bug in one field. The inspect verb
+	// sets it; nothing on the serving path does.
+	KeepWire bool
 }
 
 // Reply is a server's answer together with how it was obtained. The CLI reports
@@ -86,6 +105,16 @@ type Reply struct {
 	// RTT spans the whole exchange, so a reply that fell back to TCP includes
 	// the UDP attempt that provoked it.
 	RTT time.Duration
+
+	// Wire is the message exactly as it arrived, and is set only when the
+	// transport was asked to keep it. It is a copy rather than a slice of the
+	// read buffer, since that buffer is reused for the next datagram.
+	Wire []byte
+
+	// Sent is the name as it went out, which is the question with its case
+	// randomised when the 0x20 defence is on. It is here so that a trace can
+	// show the nonce that was actually used rather than assert that one was.
+	Sent wire.Name
 }
 
 // Exchange asks server one question and returns its reply.
@@ -104,31 +133,103 @@ func (t *Transport) Exchange(ctx context.Context, server netip.AddrPort, q wire.
 		return nil, fmt.Errorf("resolver: %v is not a usable server address", server)
 	}
 
-	query, id, err := t.query(q)
-	if err != nil {
-		return nil, err
-	}
-
+	// The parent is kept because one path needs a deadline of its own: a server
+	// that turns out not to preserve case has already had this exchange's whole
+	// allowance spent waiting for a reply that never came, and the retry cannot
+	// run on what is left of it. That costs up to two timeouts, once per server,
+	// and every exchange after it is back to one.
+	parent := ctx
 	ctx, cancel := context.WithTimeout(ctx, t.timeout())
 	defer cancel()
 
 	start := time.Now()
 
 	if !t.ForceTCP {
-		msg, n, err := t.overUDP(ctx, server, query, id, q)
+		// The case pattern is a nonce, so it is chosen per query and never
+		// reused, and only over UDP: a TCP query is not open to an off-path
+		// forgery, since answering one means completing a handshake with our
+		// address. c-ares makes the same call for the same reason.
+		sent := q
+		if t.Case.use(server) {
+			sent.Name = randomCase(q.Name)
+		}
+
+		query, id, err := t.query(sent)
 		if err != nil {
 			return nil, err
 		}
+
+		msg, raw, err := t.overUDP(ctx, server, query, id, sent)
+		switch {
+		case errors.Is(err, errCaseMismatch):
+			// Nothing usable arrived before the deadline and the only thing
+			// wrong with what did arrive was the case. That is a server which
+			// does not preserve it, so it is recorded and asked again plainly.
+			//
+			// Waiting for the deadline first is what keeps this from being a
+			// way to switch the defence off: a forged reply with the wrong case
+			// is discarded and the read continues, so an attacker has to also
+			// stop the real answer from arriving before this path is reached at
+			// all.
+			t.Case.nonconforming(server)
+			if parent.Err() != nil {
+				return nil, err
+			}
+			return t.plainExchange(parent, server, q, start)
+		case err != nil:
+			return nil, err
+		}
 		if !msg.Header.Truncated {
-			return &Reply{Msg: msg, Server: server, Protocol: "udp", Size: n, RTT: time.Since(start)}, nil
+			restoreCase(msg, sent.Name, q.Name)
+			return t.reply(msg, raw, server, "udp", start, sent.Name), nil
 		}
 	}
 
-	msg, n, err := t.overTCP(ctx, server, query, id, q)
+	query, id, err := t.query(q)
 	if err != nil {
 		return nil, err
 	}
-	return &Reply{Msg: msg, Server: server, Protocol: "tcp", Size: n, RTT: time.Since(start)}, nil
+	msg, raw, err := t.overTCP(ctx, server, query, id, q)
+	if err != nil {
+		return nil, err
+	}
+	return t.reply(msg, raw, server, "tcp", start, q.Name), nil
+}
+
+// plainExchange asks again without randomised case, for a server that has just
+// been found not to echo it. One retry, and only over UDP, since the caller
+// falls through to TCP on its own if this reply is truncated.
+func (t *Transport) plainExchange(ctx context.Context, server netip.AddrPort, q wire.Question, start time.Time) (*Reply, error) {
+	ctx, cancel := context.WithTimeout(ctx, t.timeout())
+	defer cancel()
+
+	query, id, err := t.query(q)
+	if err != nil {
+		return nil, err
+	}
+	msg, raw, err := t.overUDP(ctx, server, query, id, q)
+	if err != nil {
+		return nil, err
+	}
+	if !msg.Header.Truncated {
+		return t.reply(msg, raw, server, "udp", start, q.Name), nil
+	}
+	msg, raw, err = t.overTCP(ctx, server, query, id, q)
+	if err != nil {
+		return nil, err
+	}
+	return t.reply(msg, raw, server, "tcp", start, q.Name), nil
+}
+
+// reply assembles what came back, keeping a copy of the octets only when the
+// caller asked for them. The copy matters: raw aliases the read buffer, which
+// the next datagram overwrites.
+func (t *Transport) reply(msg *wire.Message, raw []byte, server netip.AddrPort, proto string, start time.Time, sent wire.Name) *Reply {
+	r := &Reply{Msg: msg, Server: server, Protocol: proto, Size: len(raw), RTT: time.Since(start), Sent: sent}
+	if t.KeepWire {
+		r.Wire = append([]byte(nil), raw...)
+	}
+	return r
 }
 
 // query builds the packed query and returns the transaction ID the reply must
@@ -157,7 +258,7 @@ func (t *Transport) query(q wire.Question) ([]byte, uint16, error) {
 	return buf, m.Header.ID, nil
 }
 
-func (t *Transport) overUDP(ctx context.Context, server netip.AddrPort, query []byte, id uint16, q wire.Question) (*wire.Message, int, error) {
+func (t *Transport) overUDP(ctx context.Context, server netip.AddrPort, query []byte, id uint16, q wire.Question) (*wire.Message, []byte, error) {
 	// Dial rather than ListenPacket: a connected UDP socket makes the kernel
 	// drop datagrams from any other address and port, which is a filter no
 	// amount of checking in this process can match for cost. The source port is
@@ -169,14 +270,14 @@ func (t *Transport) overUDP(ctx context.Context, server netip.AddrPort, query []
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "udp", server.String())
 	if err != nil {
-		return nil, 0, fmt.Errorf("resolver: dialing %v over udp: %w", server, err)
+		return nil, nil, fmt.Errorf("resolver: dialing %v over udp: %w", server, err)
 	}
 	defer conn.Close()
 	stop := watch(ctx, conn)
 	defer stop()
 
 	if _, err := conn.Write(query); err != nil {
-		return nil, 0, fmt.Errorf("resolver: sending to %v over udp: %w", server, err)
+		return nil, nil, fmt.Errorf("resolver: sending to %v over udp: %w", server, err)
 	}
 
 	// One octet past what was advertised. A datagram longer than the buffer
@@ -196,12 +297,12 @@ func (t *Transport) overUDP(ctx context.Context, server netip.AddrPort, query []
 		n, err := conn.Read(buf)
 		if err != nil {
 			if unusable != nil {
-				return nil, 0, fmt.Errorf("resolver: %v over udp: %w", server, unusable)
+				return nil, nil, fmt.Errorf("resolver: %v over udp: %w", server, unusable)
 			}
-			return nil, 0, failure(ctx, err, server, "udp", "reading the reply")
+			return nil, nil, failure(ctx, err, server, "udp", "reading the reply")
 		}
 		if n > size {
-			return nil, 0, fmt.Errorf("resolver: %v replied with more than the %d octets advertised: %w", server, size, ErrOversized)
+			return nil, nil, fmt.Errorf("resolver: %v replied with more than the %d octets advertised: %w", server, size, ErrOversized)
 		}
 		msg, err := accept(buf[:n], id, q)
 		if err != nil {
@@ -210,19 +311,19 @@ func (t *Transport) overUDP(ctx context.Context, server netip.AddrPort, query []
 			}
 			continue
 		}
-		return msg, n, nil
+		return msg, buf[:n], nil
 	}
 }
 
-func (t *Transport) overTCP(ctx context.Context, server netip.AddrPort, query []byte, id uint16, q wire.Question) (*wire.Message, int, error) {
+func (t *Transport) overTCP(ctx context.Context, server netip.AddrPort, query []byte, id uint16, q wire.Question) (*wire.Message, []byte, error) {
 	if len(query) > 65535 {
-		return nil, 0, fmt.Errorf("resolver: query of %d octets does not fit the TCP length prefix", len(query))
+		return nil, nil, fmt.Errorf("resolver: query of %d octets does not fit the TCP length prefix", len(query))
 	}
 
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "tcp", server.String())
 	if err != nil {
-		return nil, 0, fmt.Errorf("resolver: dialing %v over tcp: %w", server, err)
+		return nil, nil, fmt.Errorf("resolver: dialing %v over tcp: %w", server, err)
 	}
 	defer conn.Close()
 	stop := watch(ctx, conn)
@@ -236,19 +337,19 @@ func (t *Transport) overTCP(ctx context.Context, server netip.AddrPort, query []
 	binary.BigEndian.PutUint16(framed, uint16(len(query)))
 	copy(framed[2:], query)
 	if _, err := conn.Write(framed); err != nil {
-		return nil, 0, fmt.Errorf("resolver: sending to %v over tcp: %w", server, err)
+		return nil, nil, fmt.Errorf("resolver: sending to %v over tcp: %w", server, err)
 	}
 
 	var prefix [2]byte
 	if _, err := io.ReadFull(conn, prefix[:]); err != nil {
-		return nil, 0, failure(ctx, err, server, "tcp", "reading the length prefix")
+		return nil, nil, failure(ctx, err, server, "tcp", "reading the length prefix")
 	}
 
 	// A zero length needs no special case: an empty message fails to decode as
 	// a truncated one, which is what it is.
 	body := make([]byte, binary.BigEndian.Uint16(prefix[:]))
 	if _, err := io.ReadFull(conn, body); err != nil {
-		return nil, 0, failure(ctx, err, server, "tcp", fmt.Sprintf("reading the %d octets promised", len(body)))
+		return nil, nil, failure(ctx, err, server, "tcp", fmt.Sprintf("reading the %d octets promised", len(body)))
 	}
 
 	// No retry loop here. On UDP anyone can send us a datagram, so a mismatch
@@ -256,9 +357,9 @@ func (t *Transport) overTCP(ctx context.Context, server netip.AddrPort, query []
 	// mismatch means the server is wrong, and there is no second reply coming.
 	msg, err := accept(body, id, q)
 	if err != nil {
-		return nil, 0, fmt.Errorf("resolver: %v over tcp: %w", server, err)
+		return nil, nil, fmt.Errorf("resolver: %v over tcp: %w", server, err)
 	}
-	return msg, len(body), nil
+	return msg, body, nil
 }
 
 // accept decodes a reply and reports why it cannot answer the query that was
@@ -286,7 +387,32 @@ func accept(datagram []byte, id uint16, q wire.Question) (*wire.Message, error) 
 		return nil, fmt.Errorf("reply echoes the question %s %s class %d, not %s %s class %d",
 			got.Name, got.Type, got.Class, q.Name, q.Type, q.Class)
 	}
+
+	// With 0x20 the case is a nonce, and a reply that matches everything but the
+	// case is either a server that lowercased the question or an attacker who
+	// guessed the id and the port but could not see the case. Neither is an
+	// answer, and the two are told apart by the caller, not here.
+	if q.Name != m.Questions[0].Name && hasCase(q.Name) {
+		return nil, fmt.Errorf("reply echoes %s, not the case that was sent, %s: %w",
+			m.Questions[0].Name, q.Name, errCaseMismatch)
+	}
 	return m, nil
+}
+
+// errCaseMismatch marks the one failure that has a fallback: everything about
+// the reply matched except the case of the name.
+var errCaseMismatch = errors.New("question echoed with the case changed")
+
+// hasCase reports whether a name has a letter in it, and so whether the 0x20
+// comparison means anything for it. A name of digits and hyphens carries no
+// nonce, and refusing a reply over its case would be refusing over nothing.
+func hasCase(n wire.Name) bool {
+	for i := range len(n) {
+		if isASCIILetter(n[i]) {
+			return true
+		}
+	}
+	return false
 }
 
 // failure names why a socket stopped, distinguishing a caller who cancelled
