@@ -14,6 +14,7 @@ import (
 	"github.com/DevInIndia/hollow/internal/cache"
 	"github.com/DevInIndia/hollow/internal/resolver"
 	"github.com/DevInIndia/hollow/internal/server"
+	"github.com/DevInIndia/hollow/internal/single"
 	"github.com/DevInIndia/hollow/internal/wire"
 )
 
@@ -133,9 +134,23 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 }
 
 // recursor answers a query by resolving it from the root.
+//
+// It must not be copied: inflight holds a mutex, and every use of a recursor is
+// through the pointer stored in the server's Handler field.
 type recursor struct {
 	resolver *resolver.Resolver
 	log      *slog.Logger
+
+	// inflight collapses concurrent identical queries into one resolution.
+	//
+	// The cache answers the second query for a name. This answers the second
+	// query that arrives while the first is still walking, which is the case
+	// the cache cannot help with and which a DNS server sees constantly: a
+	// page load fires a dozen lookups for one host at once, and a cold name
+	// under a sixty-four wide pool would otherwise start sixty-four identical
+	// walks from the root, each ending by storing the answer the others were
+	// about to store.
+	inflight single.Group[wire.Question, *resolver.Result]
 }
 
 // ServeDNS resolves one query. It is called from many goroutines at once;
@@ -158,7 +173,19 @@ func (rc *recursor) ServeDNS(ctx context.Context, query *wire.Message) *wire.Mes
 	}
 
 	start := time.Now()
-	res, err := rc.resolver.Resolve(ctx, q)
+
+	// Keyed on the folded name, so two clients spelling one name differently
+	// share a walk rather than starting two. The reply each client gets echoes
+	// its own question, which is built below from that client's message.
+	//
+	// The context belongs to whichever query arrived first, and the others
+	// inherit its deadline. That is sound here because the server gives every
+	// query the same timeout, so the leader's deadline is representative rather
+	// than arbitrary.
+	key := wire.Question{Name: q.Name.Fold(), Type: q.Type, Class: q.Class}
+	res, err, shared := rc.inflight.Do(key, func() (*resolver.Result, error) {
+		return rc.resolver.Resolve(ctx, q)
+	})
 	if err != nil {
 		rc.log.Debug("resolution failed", "name", q.Name.String(), "type", q.Type.String(), "err", err)
 		return refuse(query, wire.RcodeServFail)
@@ -174,7 +201,7 @@ func (rc *recursor) ServeDNS(ctx context.Context, query *wire.Message) *wire.Mes
 	rc.log.Debug("answered",
 		"name", q.Name.String(), "type", q.Type.String(),
 		"rcode", res.Reply.Msg.Header.Rcode, "queries", res.Queries,
-		"cached", res.CacheHit,
+		"cached", res.CacheHit, "shared", shared,
 		"took", time.Since(start).Round(time.Millisecond).String())
 
 	return rc.reply(query, res)
