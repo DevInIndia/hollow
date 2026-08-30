@@ -62,6 +62,21 @@ dig +tcp @127.0.0.1 -p 15353 google.com MX
 ./hollow serve --workers 128 --timeout 3s
 ```
 
+Filter names, in the formats the published lists are already written in:
+
+```bash
+# A hosts-format list, an adblock-format list and a domain-per-line list are
+# all read by the same parser. --block and --allow may each be given repeatedly.
+curl -o hosts.txt https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
+./hollow serve --block hosts.txt
+
+# Keep something the list blocks. The allowlist wins over every block.
+./hollow serve --block hosts.txt --allow keep.txt
+
+# Answer blocked names with an unroutable address instead of NXDOMAIN
+./hollow serve --block hosts.txt --block-mode null
+```
+
 `--trace` writes the path to stderr and the answer to stdout, so redirecting stdout captures only records:
 
 ```
@@ -107,6 +122,10 @@ The codebase is organized into clean, focused packages:
 * `internal/resolver/`: Transport (UDP with automatic TCP fallback on truncation) and the iterative loop that walks delegations from the root.
 * `internal/server/`: Concurrent UDP (bounded worker pool) and TCP (goroutine per connection) listeners, with shutdown. See the concurrency model below.
 * `internal/roothints/`: The 13 root servers as data, plus a `named.root` parser for `--hints`.
+* `internal/cache/`: Sharded answer and delegation store with LRU eviction, RFC 2308 negative caching and RFC 8767 serve-stale.
+* `internal/single/`: Request coalescing, so concurrent identical queries share one resolution.
+* `internal/blocklist/`: Hosts, domain-per-line and adblock list parsing, suffix matching and the block response modes.
+* `internal/stats/`: Counters, a recent-query ring and the event stream, none of which the query path can block on.
 
 ### How resolution is kept safe
 
@@ -117,6 +136,20 @@ The zones being walked are published by whoever owns the name, so the loop treat
 * **Bounded work.** 16 delegations, 64 queries and 8 CNAME links per resolution. Resolving a nameserver that came with no glue shares that same budget rather than starting a fresh one.
 * **No recursion requested.** `RD` is cleared on every iterative query. A server that honoured it would return an answer whose delegation path was never checked.
 * **CNAME loops** are detected by name, not just by hop count.
+
+### Filtering, and the four things that make it correct
+
+`--block` takes lists in the formats people already publish them in: hosts format, one domain per line, and the adblock `||domain^` rule. A blocked name is answered before the cache and before the resolver, so it costs one map lookup and never reaches the network.
+
+**The hosts preamble is skipped by name.** Every real hosts list opens with `localhost`, `localhost.localdomain`, `local` and `broadcasthost`, and a parser that takes field two of every line ingests all of them. A resolver that blocks `localhost` breaks the machine it is running on. Filtering the literal string `localhost` is not enough, since three of those four get past it, and the last line of the preamble is `::1 localhost`, so anything expecting a dotted quad in field one mis-reads it. Field one is parsed as an address, not matched against a list of them.
+
+**Suffix matching walks label boundaries, never bytes.** `||example.com^` blocks `example.com` and everything under it. It does not block `notexample.com`, which a `strings.HasSuffix` test would, and it does not place `evil\.com` inside `com`, because the escaped dot makes that one label whose octets merely end in `com`. This is the same comparison the bailiwick check uses, for the same reason.
+
+**Block modes are internally consistent.** A name either exists or it does not, and the answer says the same thing whichever type is asked for. `nxdomain` says the name does not exist, for every type. `null` returns `0.0.0.0` for A and `::` for AAAA, and NODATA for everything else, never NXDOMAIN: returning an address for A while returning NXDOMAIN for AAAA tells one browser two incompatible things about one name inside a few milliseconds, and the resulting bug reads as intermittent. `nodata` says the name exists with no records of that type. Every negative answer carries a synthetic SOA so a downstream resolver has a TTL to cache it against.
+
+**Lines that do not parse are counted and skipped, and the count is printed at startup.** A list that half-loads in silence looks exactly like one that loaded whole, and the names that went missing are the ones that stopped being blocked. A missing file is a different matter and is fatal, because an operator who named a file expects that file to be in effect.
+
+**Two maps, and that is on purpose.** The StevenBlack list, the one nearly everybody loads, is 79,746 entries and 5.5 MB of heap, 72 bytes each, measured by `TestTheRealList`. Ten of those concatenated would still be around 55 MB. A trie, a radix tree, a bloom filter or interned strings would each save some part of six megabytes and would each be a hand-rolled structure on the path of every query. Optimising a 6 MB problem by hand is a good way to put bugs in a feature that already works. As a check on the parser rather than the structure: the count hollow arrives at matches the count the list publishes in its own header, and no line in it is skipped.
 
 ## Concurrency Model
 
@@ -156,6 +189,8 @@ Statistics are collected on every query, and nothing about collecting them can m
 * **The cache does not survive the process**: answers and delegations are held in memory only, so a restart starts cold and every name is walked again. `hollow resolve` is a fresh process per invocation and therefore runs with no cache at all, which is why a single `resolve` is no faster the second time while `serve` is.
 * **Serve-stale does not refresh in the background**: RFC 8767 says to continue the resolution attempt after the stale answer is sent. `hollow` does not spawn a detached refresh, because an unbounded set of background resolutions is exactly what the bounded worker pool exists to prevent. The next query for the name retries instead, so an expired entry stays expired until somebody asks for it again.
 * **The server passes on no additional records**: an answer to an MX or SRV query arrives without the addresses of the hosts it names, so the client looks them up itself. The upstream additional section is dropped rather than forwarded, because unlike the glue used during resolution it was never bailiwick-checked, and forwarding unchecked records to a client is how a resolver launders someone else's data.
+* **Blocklists are read once, at startup**: there is no reload, so changing a list means restarting the server. Reload belongs on a control socket, which is not built. `SIGHUP` is the usual answer and is not one here, because it does not exist on Windows and this repository cross-compiles for it.
+* **The allowlist is global, not per-client**: an allowed name is allowed for everybody that can reach the server. There is no notion of which client asked, beyond the address recorded in the statistics.
 * **No per-client accounting**: the worker pool, the connection cap and the query budget are all global. A single client can occupy the whole server, and there is no rate limiting.
 * **DNSSEC**: EDNS0 is implemented and queries advertise a 1232-octet payload size. The DO bit is decoded and displayed when a server sets it, but there is no flag to request DNSSEC records and no validation of them. A forged delegation from a compromised parent zone would not be detected.
 * **Nameserver selection is random, not measured**: candidates are shuffled to avoid always paying the slowest server's latency, but there is no RTT tracking, so a fast server is no more likely to be chosen the second time.

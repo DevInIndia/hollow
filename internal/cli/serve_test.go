@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DevInIndia/hollow/internal/blocklist"
 	"github.com/DevInIndia/hollow/internal/resolver"
 	"github.com/DevInIndia/hollow/internal/stats"
 	"github.com/DevInIndia/hollow/internal/wire"
@@ -36,6 +37,16 @@ func TestServeRejectsBadArguments(t *testing.T) {
 		// other silently would leave the operator believing they had asked for
 		// something they did not get.
 		"stale without a cache": {"--cache-size", "0", "--serve-stale", "1h"},
+
+		// A block mode nobody implements, and a list file that is not there.
+		// Both stop the server before it binds, for the same reason the hints
+		// file does: a resolver that is running but not filtering looks exactly
+		// like one that is.
+		"an unknown block mode": {"--block-mode", "refuse"},
+		"a missing block file":  {"--block", "/nonexistent/hosts"},
+
+		// An allowlist with no blocklist to override does nothing at all.
+		"allow with nothing to allow past": {"--allow", "/nonexistent/allow"},
 	}
 
 	for name, args := range tests {
@@ -321,5 +332,132 @@ func TestReportNamesWhatItCounted(t *testing.T) {
 	// that always reads zero is one an operator learns to skip.
 	if strings.Contains(got, "dropped") {
 		t.Errorf("report mentions drops when there were none:\n%s", got)
+	}
+}
+
+// blocking builds a recursor that will refuse the given names. Its resolver has
+// no root hints, so anything reaching resolution fails, which is exactly what
+// makes it visible whether the blocklist answered before the walk started.
+func blocking(t *testing.T, mode blocklist.Mode, list string) (*recursor, *stats.Collector) {
+	t.Helper()
+	l, err := blocklist.Parse([]io.Reader{strings.NewReader(list)}, nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	col := stats.New()
+	return &recursor{
+		resolver: &resolver.Resolver{}, log: discard(), stats: col,
+		blocks: l, blockMode: mode,
+	}, col
+}
+
+func ask(t *testing.T, rc *recursor, n string, typ wire.Type) *wire.Message {
+	t.Helper()
+	name, err := wire.ParseName(n)
+	if err != nil {
+		t.Fatalf("ParseName(%q): %v", n, err)
+	}
+	return rc.ServeDNS(context.Background(), &wire.Message{
+		Header:    wire.Header{ID: 9, RecursionDesired: true},
+		Questions: []wire.Question{{Name: name, Type: typ, Class: wire.ClassIN}},
+	}, testClient)
+}
+
+func TestABlockedNameIsAnsweredWithoutResolving(t *testing.T) {
+	rc, col := blocking(t, blocklist.ModeNXDomain, "0.0.0.0 ads.example.com\n")
+
+	reply := ask(t, rc, "ads.example.com.", wire.TypeA)
+	if reply.Header.Rcode != wire.RcodeNXDomain {
+		t.Errorf("rcode = %d, want NXDOMAIN", reply.Header.Rcode)
+	}
+
+	s := col.Snapshot()
+	if s.QueriesBlocked != 1 {
+		t.Errorf("QueriesBlocked = %d, want 1", s.QueriesBlocked)
+	}
+	if s.UpstreamErrors != 0 {
+		// The resolver has no hints, so any attempt to resolve would fail and
+		// be counted. Zero here is the proof that the block answered first.
+		t.Errorf("UpstreamErrors = %d, want 0; the query reached the resolver", s.UpstreamErrors)
+	}
+	if len(s.TopBlocked) != 1 || s.TopBlocked[0].Name != "ads.example.com." {
+		t.Errorf("TopBlocked = %+v, want ads.example.com.", s.TopBlocked)
+	}
+}
+
+func TestAnUnblockedNameIsNotCountedAsBlocked(t *testing.T) {
+	// The counter has to distinguish a blocked NXDOMAIN from a real one, which
+	// is why it is passed in rather than read off the rcode.
+	rc, col := blocking(t, blocklist.ModeNXDomain, "0.0.0.0 ads.example.com\n")
+
+	reply := ask(t, rc, "www.example.com.", wire.TypeA)
+	if reply.Header.Rcode != wire.RcodeServFail {
+		t.Errorf("rcode = %d, want SERVFAIL from the hint-less resolver", reply.Header.Rcode)
+	}
+	if s := col.Snapshot(); s.QueriesBlocked != 0 {
+		t.Errorf("QueriesBlocked = %d, want 0", s.QueriesBlocked)
+	}
+}
+
+func TestTheBlockModeReachesTheClient(t *testing.T) {
+	rc, _ := blocking(t, blocklist.ModeNull, "||example.com^\n")
+
+	reply := ask(t, rc, "ads.example.com.", wire.TypeA)
+	if reply.Header.Rcode != wire.RcodeSuccess || len(reply.Answers) != 1 {
+		t.Fatalf("rcode %d with %d answers, want 0 and 1", reply.Header.Rcode, len(reply.Answers))
+	}
+	if a, ok := reply.Answers[0].Data.(wire.A); !ok || a.Addr.String() != "0.0.0.0" {
+		t.Errorf("answer = %v, want 0.0.0.0", reply.Answers[0].Data)
+	}
+}
+
+func TestReportBlocklistSaysWhatLoadedAndWhatDidNot(t *testing.T) {
+	l, err := blocklist.Parse([]io.Reader{strings.NewReader("a.example\n||b.example^\nnonsense line one\n")}, nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	var out strings.Builder
+	reportBlocklist(&out, l, blocklist.ModeNoData)
+
+	got := out.String()
+	for _, want := range []string{"1 names", "1 domains", "nodata", "1 lines skipped"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("startup line is missing %q:\n%s", want, got)
+		}
+	}
+
+	// Nothing loaded and nothing to say.
+	out.Reset()
+	reportBlocklist(&out, nil, blocklist.ModeNXDomain)
+	if out.Len() != 0 {
+		t.Errorf("reportBlocklist with no list printed %q", out.String())
+	}
+}
+
+func TestSkippedLinesAreSilentWhenThereAreNone(t *testing.T) {
+	l, err := blocklist.Parse([]io.Reader{strings.NewReader("a.example\n")}, nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	var out strings.Builder
+	reportBlocklist(&out, l, blocklist.ModeNXDomain)
+	if strings.Contains(out.String(), "skipped") {
+		t.Errorf("a clean list reported skipped lines:\n%s", out.String())
+	}
+}
+
+func TestStringListCollectsRepeatedFlags(t *testing.T) {
+	var s stringList
+	if err := s.Set("one"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := s.Set("two"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := s.Set(""); err == nil {
+		t.Error("Set accepted an empty path")
+	}
+	if got := s.String(); got != "one,two" {
+		t.Errorf("String() = %q, want \"one,two\"", got)
 	}
 }

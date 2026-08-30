@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -9,9 +10,11 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/DevInIndia/hollow/internal/blocklist"
 	"github.com/DevInIndia/hollow/internal/cache"
 	"github.com/DevInIndia/hollow/internal/resolver"
 	"github.com/DevInIndia/hollow/internal/server"
@@ -40,7 +43,11 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 		verbose = fs.Bool("verbose", false, "log every query answered")
 		size    = fs.Int("cache-size", cache.DefaultEntries, "answers to hold in the cache; 0 disables caching")
 		stale   = fs.Duration("serve-stale", 0, "how long past expiry an answer may still be served when resolution fails; 0 disables")
+		mode    = fs.String("block-mode", "nxdomain", "how a blocked name is answered: nxdomain, null or nodata")
 	)
+	var block, allow stringList
+	fs.Var(&block, "block", "blocklist file in hosts, domain-per-line or adblock format; repeatable")
+	fs.Var(&allow, "allow", "allowlist file in the same formats, overriding every block; repeatable")
 	fs.Usage = func() {
 		fmt.Fprint(stderr, "usage: hollow serve [flags]\n\nflags:\n")
 		fs.PrintDefaults()
@@ -66,6 +73,28 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 		// two flags the operator set is worse than refusing both.
 		fmt.Fprintln(stderr, "hollow: --serve-stale needs a cache, but --cache-size is 0")
 		return ExitFailure
+	}
+	blockMode, err := blocklist.ParseMode(*mode)
+	if err != nil {
+		fmt.Fprintf(stderr, "hollow: %v\n", err)
+		return ExitFailure
+	}
+	if len(allow) > 0 && len(block) == 0 {
+		// An allowlist with nothing to override does nothing. Saying so beats
+		// starting a server that quietly ignores a flag the operator set.
+		fmt.Fprintln(stderr, "hollow: --allow needs something to allow past, but no --block was given")
+		return ExitFailure
+	}
+
+	// Loaded before anything binds a socket, so a bad path is a message and an
+	// exit rather than a running server that is not filtering.
+	var blocks *blocklist.List
+	if len(block) > 0 {
+		blocks, err = blocklist.Load(block, allow)
+		if err != nil {
+			fmt.Fprintf(stderr, "hollow: %v\n", err)
+			return ExitFailure
+		}
 	}
 
 	level := slog.LevelInfo
@@ -103,7 +132,7 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 	}
 
 	s := &server.Server{
-		Handler: &recursor{resolver: r, log: log, stats: col},
+		Handler: &recursor{resolver: r, log: log, stats: col, blocks: blocks, blockMode: blockMode},
 		Workers: *workers,
 		Timeout: *timeout,
 		Log:     log,
@@ -129,6 +158,7 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 	default:
 		fmt.Fprintf(stdout, "cache holding %d answers\n", *size)
 	}
+	reportBlocklist(stdout, blocks, blockMode)
 
 	if err := s.Serve(ctx, conns); err != nil {
 		fmt.Fprintf(stderr, "hollow: %v\n", err)
@@ -145,6 +175,40 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 	report(stdout, col.Snapshot())
 	fmt.Fprintln(stdout, "hollow stopped")
 	return ExitOK
+}
+
+// stringList collects a flag given more than once, which is how --block and
+// --allow take several files. flag has no built-in for it.
+type stringList []string
+
+func (s *stringList) String() string { return strings.Join(*s, ",") }
+
+func (s *stringList) Set(v string) error {
+	if v == "" {
+		return errors.New("empty path")
+	}
+	*s = append(*s, v)
+	return nil
+}
+
+// reportBlocklist says what was loaded, at startup, where an operator is still
+// watching.
+//
+// The skipped count is the part that matters. Lines that do not parse are
+// counted and dropped rather than being fatal, which is only defensible if the
+// number is put in front of somebody: a list that half-loads in silence looks
+// exactly like one that loaded whole, and the names that went missing are the
+// ones that stop being blocked.
+func reportBlocklist(w io.Writer, l *blocklist.List, mode blocklist.Mode) {
+	if l == nil {
+		return
+	}
+	exact, wildcard, allowed, skipped := l.Counts()
+	fmt.Fprintf(w, "blocking %d names and %d domains with everything under them, %d allowed past, answering %s\n",
+		exact, wildcard, allowed, mode)
+	if skipped > 0 {
+		fmt.Fprintf(w, "blocklist: %d lines skipped, not in any format hollow reads\n", skipped)
+	}
 }
 
 // report prints what the server did. Until the control socket exists this is
@@ -176,6 +240,14 @@ func report(w io.Writer, s stats.Snapshot) {
 	}
 }
 
+// Named for the call sites in ServeDNS. A bare true or false as the last
+// argument of record would be six places where the reader has to go and look at
+// the signature to find out what it means.
+const (
+	notBlocked = false
+	wasBlocked = true
+)
+
 // recursor answers a query by resolving it from the root.
 //
 // It must not be copied: inflight holds a mutex, and every use of a recursor is
@@ -189,6 +261,12 @@ type recursor struct {
 	// concrete type rather than an interface, because there is one
 	// implementation and one consumer.
 	stats *stats.Collector
+
+	// blocks names the client is refused, and blockMode is what it is refused
+	// with. A nil List blocks nothing, which is how the whole feature stays
+	// optional without a check here.
+	blocks    *blocklist.List
+	blockMode blocklist.Mode
 
 	// inflight collapses concurrent identical queries into one resolution.
 	//
@@ -210,17 +288,25 @@ func (rc *recursor) ServeDNS(ctx context.Context, query *wire.Message, from neti
 	if query.Header.Opcode != 0 {
 		// UPDATE, NOTIFY and the rest. We are a resolver, and pretending
 		// otherwise by returning success would be worse than saying so.
-		return rc.record(start, from, wire.Question{}, refuse(query, wire.RcodeNotImp), nil)
+		return rc.record(start, from, wire.Question{}, refuse(query, wire.RcodeNotImp), nil, notBlocked)
 	}
 	if len(query.Questions) != 1 {
 		// RFC 1035 allows QDCOUNT above one and no implementation has ever
 		// agreed on what it would mean.
-		return rc.record(start, from, wire.Question{}, refuse(query, wire.RcodeFormErr), nil)
+		return rc.record(start, from, wire.Question{}, refuse(query, wire.RcodeFormErr), nil, notBlocked)
 	}
 
 	q := query.Questions[0]
 	if q.Class != wire.ClassIN {
-		return rc.record(start, from, q, refuse(query, wire.RcodeRefused), nil)
+		return rc.record(start, from, q, refuse(query, wire.RcodeRefused), nil, notBlocked)
+	}
+
+	// Before the cache and before the coalescing map. A blocked name must not
+	// reach the network at all, and answering it here means a blocked query
+	// costs one map lookup rather than a walk from the root.
+	if rc.blocks.Blocked(q.Name) {
+		rc.log.Debug("blocked", "name", q.Name.String(), "type", q.Type.String())
+		return rc.record(start, from, q, blocklist.Reply(query, rc.blockMode), nil, wasBlocked)
 	}
 
 	// Keyed on the folded name, so two clients spelling one name differently
@@ -237,7 +323,7 @@ func (rc *recursor) ServeDNS(ctx context.Context, query *wire.Message, from neti
 	})
 	if err != nil {
 		rc.log.Debug("resolution failed", "name", q.Name.String(), "type", q.Type.String(), "err", err)
-		return rc.record(start, from, q, refuse(query, wire.RcodeServFail), nil)
+		return rc.record(start, from, q, refuse(query, wire.RcodeServFail), nil, notBlocked)
 	}
 	if res.Stale {
 		// Upstream failed and the client is getting an answer that expired.
@@ -253,7 +339,7 @@ func (rc *recursor) ServeDNS(ctx context.Context, query *wire.Message, from neti
 		"cached", res.CacheHit, "shared", shared,
 		"took", time.Since(start).Round(time.Millisecond).String())
 
-	return rc.record(start, from, q, rc.reply(query, res), res)
+	return rc.record(start, from, q, rc.reply(query, res), res, notBlocked)
 }
 
 // record accounts for one answered query and returns the reply unchanged, so
@@ -264,7 +350,12 @@ func (rc *recursor) ServeDNS(ctx context.Context, query *wire.Message, from neti
 // number of packets the server actually answered.
 //
 // res is nil on every path that did not reach a resolution.
-func (rc *recursor) record(start time.Time, from netip.Addr, q wire.Question, reply *wire.Message, res *resolver.Result) *wire.Message {
+//
+// blocked is the one thing that cannot be read back off the reply: a blocked
+// name and a name that genuinely does not exist both come back NXDOMAIN, which
+// is the point of the mode, and inferring one from the other would put every
+// real NXDOMAIN in the blocked count.
+func (rc *recursor) record(start time.Time, from netip.Addr, q wire.Question, reply *wire.Message, res *resolver.Result, blocked bool) *wire.Message {
 	if rc.stats == nil {
 		return reply
 	}
@@ -273,6 +364,7 @@ func (rc *recursor) record(start time.Time, from netip.Addr, q wire.Question, re
 		Client:   from,
 		Type:     uint16(q.Type),
 		Rcode:    reply.Header.Rcode,
+		Blocked:  blocked,
 		Duration: time.Since(start),
 	}
 	if q.Name != "" {
