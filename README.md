@@ -9,7 +9,7 @@ It resolves names the way a recursive resolver does: starting at the root, follo
 Unlike standard DNS utilities and servers, `hollow` is built from the ground up under strict zero-dependency constraints:
 
 * **Zero Upstream Dependency (Root Walker)**: Traditional lookups (`nslookup`, `dig`) send queries to stub resolvers (like `8.8.8.8` or system DNS). `hollow` performs genuine root-to-authoritative iterative walks starting at IANA root servers (`a.root-servers.net` to `m.root-servers.net`).
-* **Zero Third-Party Code (Standard Library Only)**: Most Go DNS software uses `github.com/miekg/dns`. `hollow` replaces it entirely with `internal/wire`, a hand-written 1,317-line codec that parses raw wire-format octets, handles domain compression pointers safely, and packs EDNS0 pseudo-records.
+* **Zero Third-Party Code (Standard Library Only)**: Most Go DNS software uses `github.com/miekg/dns`. `hollow` replaces it entirely with `internal/wire`, a hand-written 1,341-line codec that parses raw wire-format octets, handles domain compression pointers safely, and packs EDNS0 pseudo-records.
 * **Deterministic & Reproducible Builds**: Built with `-trimpath` and `-buildvcs=false`. Every build across any directory produces a 100% byte-identical executable verified via `make reproduce`.
 * **Integrated CLI & Server Engine**: Combines dig-style resolution formatting, structured JSON output, a delegation-path visualiser, an annotated hexdump of the raw reply, and a concurrent UDP/TCP server engine in one single binary.
 * **Shows Its Work**: `hollow trace` draws the delegation chain the resolver actually walked, instrumented rather than replayed, and `hollow inspect` accounts for every octet of a reply with the compression pointers resolved.
@@ -399,6 +399,49 @@ What the numbers say, which is the reason they are here rather than in a footnot
 * **The live feed starts empty**: it carries what has happened since the dashboard attached, not what happened before. The server keeps a ring of recent queries, but the stream deliberately begins at the moment of subscription, so a dashboard opened on a busy server shows top-N lists that are already populated beside a feed that is not.
 * **Nameserver selection is random, not measured**: candidates are shuffled to avoid always paying the slowest server's latency, but there is no RTT tracking, so a fast server is no more likely to be chosen the second time.
 
+## What This Binary Replaces
+
+A conventional Go implementation of this project would install the packages below. Every one of them is a good package and the point is not that they are bad, it is that the standard library was enough and the substitutions are specific rather than rhetorical.
+
+The figures are the **"Known importers" count published by pkg.go.dev**, read on **2026-08-30** from each package's `?tab=importedby` page. That is a count of packages the module index knows import it, not a download count, and it is quoted because it is a number anybody can check at the same URL rather than one asserted here.
+
+| Package a normal build would install | Known importers | What `hollow` does instead |
+|---|---|---|
+| [`github.com/sirupsen/logrus`](https://pkg.go.dev/github.com/sirupsen/logrus?tab=importedby) | 239,958 | `log/slog` with a `TextHandler` on stderr. Four lines, and the design decision it forced into the open is that only the first dropped UDP packet is logged and the rest are counted, so a packet flood does not become a disk flood. |
+| [`github.com/spf13/cobra`](https://pkg.go.dev/github.com/spf13/cobra?tab=importedby) | 195,884 | `flag` and a verb switch in `cmd/hollow`. `flag.ContinueOnError` with an explicit `SetOutput`, so a bad flag returns an exit code instead of calling `os.Exit`, which is what makes every verb testable. |
+| [`github.com/stretchr/testify/require`](https://pkg.go.dev/github.com/stretchr/testify/require?tab=importedby) | 18,870 | `testing`, `testing/synctest` and `reflect.DeepEqual`, with every assertion spelled out as an `if` and an `Errorf`. |
+| [`github.com/miekg/dns`](https://pkg.go.dev/github.com/miekg/dns?tab=importedby) | 16,234 | `internal/wire`: a hand-written codec over `encoding/binary` and `net/netip` with name compression in both directions, EDNS0, nine record types, RFC 3597 handling of unknown ones, and a `testing.F` fuzz target over `Unpack`. |
+| [`github.com/stretchr/testify/assert`](https://pkg.go.dev/github.com/stretchr/testify/assert?tab=importedby) | 16,016 | As above. |
+| [`golang.org/x/time/rate`](https://pkg.go.dev/golang.org/x/time/rate?tab=importedby) | 14,348 | `internal/rrl`: a token bucket per client network over `container/list`, which is the shape `rate.Limiter` does not have, since what is needed is per source network with a bounded table. |
+| [`github.com/charmbracelet/bubbletea`](https://pkg.go.dev/github.com/charmbracelet/bubbletea?tab=importedby) | 11,682 | `internal/tui`: hand-rolled ANSI on `os.Stdout`, one buffered write per frame, and no raw mode on any platform. |
+| [`golang.org/x/sync/singleflight`](https://pkg.go.dev/golang.org/x/sync/singleflight?tab=importedby) | 3,802 | `internal/single`, about 130 lines, generic over the key as well as the value so the recursor keys on the `wire.Question` it already holds. |
+| [`github.com/hashicorp/golang-lru/v2`](https://pkg.go.dev/github.com/hashicorp/golang-lru/v2?tab=importedby) | 1,261 | `internal/cache` over `container/list`, `sync.Mutex` and `hash/maphash`. A general cache is a map with expiry; a DNS cache has to rewrite every record's TTL to the seconds remaining on the way out, which nothing off the shelf does. |
+
+### The dependency count
+
+Those nine entries are seven distinct modules. Taking each one's **published `go.mod`**, fetched from `proxy.golang.org` at the version named, and adding the modules those manifests themselves require:
+
+* `github.com/miekg/dns` v1.1.73 requires `golang.org/x/net`, `golang.org/x/sync`, `golang.org/x/sys`, and indirectly `golang.org/x/mod` and `golang.org/x/tools`
+* `github.com/spf13/cobra` requires `github.com/cpuguy83/go-md2man/v2`, `github.com/inconshreveable/mousetrap`, `github.com/spf13/pflag` and `go.yaml.in/yaml/v3`
+* `github.com/cpuguy83/go-md2man/v2` in turn requires `github.com/russross/blackfriday/v2`
+* `github.com/stretchr/testify` requires `github.com/stretchr/objx` and `go.yaml.in/yaml/v3`
+* `github.com/sirupsen/logrus` requires `github.com/stretchr/testify`, `golang.org/x/sys` and `go.yaml.in/yaml/v3`
+* `github.com/hashicorp/golang-lru/v2`, `golang.org/x/sync` and `golang.org/x/time` require nothing at all
+
+Seven chosen modules pull in ten more, and `github.com/charmbracelet/bubbletea` alone declares another eight direct and nine indirect requirements on top of that.
+
+**That is 17 third-party modules before the TUI, against 0 here.** The count is deliberately conservative: it comes from published manifests expanded one level rather than from a full transitive closure, so it is a floor and the real number is higher. It was assembled by reading `go.mod` files rather than by resolving them, because this project never runs `go get` and has no module cache to resolve them into.
+
+The evidence on this side is a command rather than a claim:
+
+```bash
+cat go.mod                                  # a module line and a go line, no require block
+ls go.sum vendor                            # neither exists
+go list -deps ./... | grep '^[^/]*\.'       # no output: nothing outside the standard library
+```
+
+All three are recorded with their output in [deps-proof.txt](deps-proof.txt), and `make verify` fails the build if any of them stops being true.
+
 ## Reproducible Build Proof
 
 `hollow` builds reproducibly: the same source produces a byte-identical binary, from any directory, because `-trimpath` keeps the build path out of it.
@@ -418,8 +461,8 @@ The published hash is not a promise, it is a gate. `make verify` reads the SHA-2
 **Bonuses claimed.** Three, each with evidence that can be rerun rather than taken on faith:
 
 * **Reproducible Build (+5).** `make reproduce` builds twice and compares; `make verify` gates the hash published above against a fresh build.
-* **STDLIB Log (+3).** [STDLIB.md](STDLIB.md) carries 37 substitutions against a required 10, each recording what the substitution actually cost.
-* **Package Killer (+3).** `internal/wire` replaces `github.com/miekg/dns`: a complete DNS codec with name compression, EDNS0, nine record types and RFC 3597 handling of unknown ones, at 1,317 lines with a fuzz target over `Unpack`.
+* **STDLIB Log (+3).** [STDLIB.md](STDLIB.md) carries 41 substitutions against a required 10, each recording what the substitution actually cost, and closes by naming the three places the standard library ran out.
+* **Package Killer (+3).** [What This Binary Replaces](#what-this-binary-replaces) names seven modules with their published importer counts, says concretely what stands in for each, and counts the dependencies a conventional build of this project would carry: 17 third-party modules against zero.
 
 Single File is not attempted.
 

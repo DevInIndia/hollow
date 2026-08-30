@@ -6,13 +6,13 @@ cost, in the terms it actually cost them: lines written, bugs shipped,
 constraints discovered. An entry that only restates the substitution is not
 worth reading.
 
-Counts below are current: 8,135 lines of non-test code and 9,511 lines of test.
+Counts below are current: 9,912 lines of non-test code and 10,960 lines of test.
 
 | Third-party package | Standard library used instead | What it cost |
 |---|---|---|
-| `github.com/miekg/dns` | `encoding/binary`, `net/netip`, hand-written codec in `internal/wire` | 1,317 lines of codec and 1,925 lines of test to reach the starting line miekg gives you for free. Two name-compression bugs shipped before the fuzz target caught them: keys that folded case, then keys that joined labels with a dot, which collided the one-label name `a.b` with the two-label pair `a`,`b` and made the encoder silently rewrite the second name into the first. Both were reachable from the network. |
+| `github.com/miekg/dns` | `encoding/binary`, `net/netip`, hand-written codec in `internal/wire` | 1,341 lines of codec and 1,925 lines of test to reach the starting line miekg gives you for free. Two name-compression bugs shipped before the fuzz target caught them: keys that folded case, then keys that joined labels with a dot, which collided the one-label name `a.b` with the two-label pair `a`,`b` and made the encoder silently rewrite the second name into the first. Both were reachable from the network. |
 | `github.com/spf13/cobra`, `urfave/cli`, `spf13/pflag` | `flag` and a verb switch in `cmd/hollow` | No shell completion, no nested subcommands, and the usage text is written by hand. `flag.ContinueOnError` with an explicit `SetOutput` was needed so a bad flag returns an exit code instead of calling `os.Exit`, which is the only reason the resolve verb is testable at all. |
-| `github.com/stretchr/testify` | `testing`, `testing/synctest`, `reflect.DeepEqual` | 9,511 lines of test for 8,135 lines of code, every assertion spelled out as an `if` and an `Errorf`. `testing/synctest` removed the tolerance windows around deadlines: inside its bubble the clock is fake, so a read that should unblock after exactly three seconds is asserted at exactly three seconds instead of within a range. Its limit is sharp and sits somewhere unhelpful, which is worth recording. A goroutine parked on a real socket can be woken from outside the bubble, so it is never durably blocked, the fake clock never advances, and the test hangs rather than fails. The end-to-end transport tests run on real sockets and real time for that reason; only the deadline mechanism itself moved into a bubble, over `net.Pipe`. |
+| `github.com/stretchr/testify` | `testing`, `testing/synctest`, `reflect.DeepEqual` | 10,960 lines of test for 9,912 lines of code, every assertion spelled out as an `if` and an `Errorf`. `testing/synctest` removed the tolerance windows around deadlines: inside its bubble the clock is fake, so a read that should unblock after exactly three seconds is asserted at exactly three seconds instead of within a range. Its limit is sharp and sits somewhere unhelpful, which is worth recording. A goroutine parked on a real socket can be woken from outside the bubble, so it is never durably blocked, the fake clock never advances, and the test hangs rather than fails. The end-to-end transport tests run on real sockets and real time for that reason; only the deadline mechanism itself moved into a bubble, over `net.Pipe`. |
 | `github.com/davecgh/go-spew` | `fmt` with `%+v` and `% x` | Comparing two 509-octet messages by eye during the compression bug, with no structural diff to lean on. `% x` on the encoder's buffer is what exposed the `c0 0c` pointer that should not have been there. |
 | `github.com/olekukonko/tablewriter` | `text/tabwriter` | `tabwriter` aligns only runs of lines with the same cell count, so the dig-style output had to be ordered so that comment lines break the runs deliberately, and the padding was chosen by looking at real output rather than configured. |
 | `github.com/google/uuid`, `math/rand` seeding for query IDs | `crypto/rand` | Almost nothing: `crypto/rand.Read` cannot fail as of Go 1.24, so a transaction ID is three lines. What it exposed is that the ID is only half the defence against a forged answer. The other half is the source port, which is why the UDP socket is dialled rather than opened with `ListenPacket`, so the kernel drops datagrams from any other address before this process sees them. |
@@ -46,10 +46,62 @@ Counts below are current: 8,135 lines of non-test code and 9,511 lines of test.
 | `github.com/hexops/valast`, hexdump helpers generally | `wire.Annotate` plus a hand-written annotation column | `encoding/hex` prints octets; what makes a DNS dump worth reading is the column beside them, and that has to come from the parser or it is fiction. Annotate walks the message with the same decoder the resolver uses and records a span per field, which is why it can resolve a compression pointer to its target offset and to the name it expands to, including the half-literal case a real MX answer produces. The property that keeps it honest is coverage: the spans are contiguous and cover every octet, asserted against the captured fixtures, so a region nobody can name fails the test rather than being skipped over. |
 | `golang.org/x/time/rate` | `internal/rrl`, a token bucket per client network over `container/list` | Banned regardless, and the wrong shape anyway: `rate.Limiter` is per limiter, and what is needed is per client network with a bounded table, since the table is otherwise an attack surface of its own. Writing it put the decisions in the open. Over the limit the response is dropped rather than refused, because an error is a response and a response is what an amplification attack wants. Every second one over is answered truncated instead, so a real client retries over TCP and succeeds while a spoofed source cannot complete the handshake, which is the difference between a rate limiter and an outage for your own clients. A network seen for the first time gets one second's allowance rather than the window's worth, so inventing new source networks is not a way to collect free responses. |
 | `math/rand` for the 0x20 nonce and the transaction ID | `crypto/rand` | The substitution is trivial and the reason is the entire feature: a nonce an attacker can predict is not a nonce. Writing it surfaced a bug that a weaker test would have shipped. Flipping the case bit with XOR looks right and is not: against a name that is already lowercase, both branches of the flip produce uppercase, so 2000 draws yielded exactly one pattern. Setting or clearing the bit rather than flipping it is the fix. The test that caught it asserts against the birthday bound rather than the number of draws, because a ten-letter name has 1024 patterns and demanding 2000 distinct ones would fail against a perfectly correct implementation. |
+| `google.golang.org/grpc`, `github.com/gorilla/websocket`, or `net/http` for the control plane | `net.Listen` on loopback, a four-octet length prefix over `encoding/binary`, and `encoding/json` | A control plane is one request and a stream of records, and HTTP would bring a server, a router and a set of status-code decisions to it. The framing is the shape DNS over TCP already has two packages away, so the code was familiar and so was the trap: a length prefix is a promise about an allocation, and a reader that believes one can be told to allocate four gigabytes by four octets. The other cost was learning where the transport boundary belongs. The types on the wire are defined in `internal/control` rather than reused from `internal/stats`, because that package deliberately knows no DNS and renders a query type as a bare `uint16`; resolving that to `MX` on the server side of the socket is what lets the dashboard never import a codec. |
+| `github.com/charmbracelet/bubbletea`, `gdamore/tcell`, `rivo/tview` | hand-rolled ANSI on `os.Stdout`, `bytes.Buffer`, and no raw mode at all | The libraries exist mostly to abstract raw mode, which is `TCGETS` and `TCSETS` on Linux, `TIOCGETA` and `TIOCSETA` with different constants on macOS, and `SetConsoleMode` on Windows. Declining to read a keypress removes all three, and the dashboard needs no terminal state beyond the alternate screen and the cursor. What the substitution cost was one bug and one near miss. Colour applied before padding computes the width from the escape sequence as well and pads short, so the layout drifts on exactly the rows that are coloured; the test that caught it renders the frame twice and compares the coloured one with its sequences stripped. The near miss is that a truncation helper with `…` written into it produces non-ASCII output from a renderer whose ASCII mode is a promise, which is why the ellipsis travels with the character set and a test scans every byte of a frame for values above 127. |
+| `golang.org/x/sys/windows` for `SetConsoleMode` | `syscall.NewLazyDLL("kernel32.dll")` and `syscall.GetConsoleMode` | Confirmed by cross-compiling rather than assumed: `syscall.GetConsoleMode` exists in the standard library for Windows and `syscall.SetConsoleMode` does not, so the getter is a plain call and only the setter goes through the DLL. `LazyDLL` resolves at first call, so a Windows build that never draws a frame never touches `kernel32`. This is the only build tag in the repository, it is two files and one function, and if the mode cannot be set the answer is plain mode rather than escape sequences printed as text into a console that will not interpret them. |
+| `golang.org/x/term.GetSize`, `github.com/nsf/termbox-go` | `os.Getenv` for `COLUMNS` and `LINES`, then flags, then a default | The one place the standard library genuinely has no answer, and the README says so rather than presenting the workaround as a design. Reading a terminal's size means `TIOCGWINSZ` or `GetConsoleScreenBufferInfo`, which is the platform-specific surface this project is built without. The fallback chain is not theoretical here: this machine reports `TERM=dumb` and does not export `COLUMNS`, so a run uses the default. The cost is real and is disclosed: a terminal resized while the dashboard runs keeps the size it started with, because noticing would mean `SIGWINCH`, which does not exist on Windows. |
 | `context.WithCancel` alone for shutdown | `context.WithoutCancel` plus a timeout | Not a package substitution, but the standard library grew the answer and it is worth recording. Cancelling the server context on SIGINT also cancels every resolution in flight, so a client that waited 400 ms gets nothing at the very end. Deriving each query's context with `WithoutCancel` lets work already begun finish while work not yet begun is discarded, and shutdown stays bounded by one query timeout rather than by the queue. |
 
-## What is not here
+## Where the standard library ran out
 
-Entries are written when they are earned, not assembled at the end. Colour
-output has an obvious standard library answer and is not in this table, because
-that code does not exist yet.
+Forty-one substitutions is a claim that the standard library was enough, and it
+mostly was. Naming the places it was not is worth more than pretending there
+were none, so here is the boundary, in the order of how much it cost.
+
+**Terminal size is the one genuine gap.** There is no portable way to ask a
+terminal how large it is. On Unix it is the `TIOCGWINSZ` ioctl, on Windows it is
+`GetConsoleScreenBufferInfo`, and the standard library exposes neither. This is
+the one place in the project where the answer is a workaround rather than a
+substitution: the size comes from `COLUMNS` and `LINES`, then from flags, then
+from a default, and a terminal resized while the dashboard is running keeps the
+size it started with, because noticing would need `SIGWINCH` and that does not
+exist on Windows. Everything else in this file replaced a package; this one
+declined to solve a problem, and the README says so in the limitations rather
+than here.
+
+**Setting the Windows console mode is a real but small gap.** `syscall` carries
+`GetConsoleMode` and not `SetConsoleMode`, which is an odd place to stop. The
+standard library provides its own way out through `syscall.NewLazyDLL`, so the
+cost was two files and one function rather than a dependency, but the asymmetry
+is worth recording because the obvious answer is `golang.org/x/sys/windows` and
+that is banned.
+
+**DNSSEC validation was not a standard library problem, and it is worth being
+clear about that.** `crypto/rsa`, `crypto/ecdsa`, `crypto/ed25519` and
+`crypto/sha256` are all present and are all that the signature arithmetic needs.
+Validation is absent because a chain of trust from the root, NSEC and NSEC3
+denial of existence, and several algorithms with their rollovers is a multi-week
+build, not because anything was missing. Recording it as a stdlib gap would be
+convenient and untrue.
+
+**TLS turned out not to be needed at all.** DNS over TLS and DNS over HTTPS were
+never in scope, so `crypto/tls` went unused, which is worth naming only because a
+reader scanning for it will notice its absence and might assume something was
+worked around.
+
+The rest of the surface was better provided than expected, and in four places
+the standard library answer arrived recently enough that a project written a
+year earlier would have imported something: `testing/synctest` for deadline
+tests with a fake clock, `hash/maphash.Comparable` for hashing a `netip.Addr`
+with no allocation, `math/rand/v2` for a shuffle that needs no seed, and
+`crypto/rand.Read` no longer being able to fail.
+
+One cosmetic cost is worth flagging because it looks like the opposite of what
+it is. `net/netip` pulls `unique` and `weak` into `deps-proof.txt`, and both read
+like third-party packages at a glance. They are standard library, and the proof
+file spends a paragraph on the same problem with
+`vendor/golang.org/x/net/dns/dnsmessage`.
+
+Entries above are written when they are earned rather than assembled at the end,
+which is why the table grew tier by tier and why each row records a cost rather
+than restating a substitution.
