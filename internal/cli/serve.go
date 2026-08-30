@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/netip"
 	"os"
 	"os/signal"
 	"syscall"
@@ -15,6 +16,7 @@ import (
 	"github.com/DevInIndia/hollow/internal/resolver"
 	"github.com/DevInIndia/hollow/internal/server"
 	"github.com/DevInIndia/hollow/internal/single"
+	"github.com/DevInIndia/hollow/internal/stats"
 	"github.com/DevInIndia/hollow/internal/wire"
 )
 
@@ -89,8 +91,19 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 		r.Cache = cache.New(cache.Config{Entries: *size, StaleFor: *stale})
 	}
 
+	// Statistics are always collected. There is no flag to turn them off
+	// because there is no cost worth a flag: three atomic adds, a sharded map
+	// update and a send that cannot block, against a query that may spend half
+	// a second on the network. A knob here would only be a knob to get wrong.
+	col := stats.New()
+	if r.Cache != nil {
+		// The one number that cannot be accumulated from events, because it is
+		// a level rather than a total.
+		col.CacheEntries = r.Cache.Len
+	}
+
 	s := &server.Server{
-		Handler: &recursor{resolver: r, log: log},
+		Handler: &recursor{resolver: r, log: log, stats: col},
 		Workers: *workers,
 		Timeout: *timeout,
 		Log:     log,
@@ -129,8 +142,38 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "cache: %d hits, %d misses, %d served stale, %d entries, %d evicted\n",
 			st.Hits, st.Misses, st.Stale, st.Entries, st.Evictions)
 	}
+	report(stdout, col.Snapshot())
 	fmt.Fprintln(stdout, "hollow stopped")
 	return ExitOK
+}
+
+// report prints what the server did. Until the control socket exists this is
+// the only way the collected statistics are visible, and a library nobody can
+// see the output of is indistinguishable from one that does not work.
+func report(w io.Writer, s stats.Snapshot) {
+	if s.QueriesTotal == 0 {
+		fmt.Fprintln(w, "queries: none")
+		return
+	}
+	fmt.Fprintf(w, "queries: %d in %v, %d blocked, %d upstream failures\n",
+		s.QueriesTotal, s.Uptime.Round(time.Second), s.QueriesBlocked, s.UpstreamErrors)
+	fmt.Fprintf(w, "latency: p50 %v, p99 %v\n",
+		s.LatencyP50.Round(time.Millisecond), s.LatencyP99.Round(time.Millisecond))
+	if len(s.TopDomains) > 0 {
+		fmt.Fprintln(w, "top names:")
+		for _, item := range s.TopDomains {
+			fmt.Fprintf(w, "  %6d  %s\n", item.Count, item.Name)
+		}
+	}
+	// Both of these are zero in ordinary operation. Printed only when they are
+	// not, because a line reading "0 dropped" every time trains an operator to
+	// stop reading it, which is the opposite of why it is here.
+	if s.EventsDropped > 0 {
+		fmt.Fprintf(w, "events: %d dropped, a consumer could not keep up\n", s.EventsDropped)
+	}
+	if s.NamesDropped > 0 {
+		fmt.Fprintf(w, "names: %d sightings left out of the lists above, the counters are full\n", s.NamesDropped)
+	}
 }
 
 // recursor answers a query by resolving it from the root.
@@ -140,6 +183,12 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 type recursor struct {
 	resolver *resolver.Resolver
 	log      *slog.Logger
+
+	// stats records what was answered. Nil disables it, which is what the
+	// handler tests use, and is the same shape as the resolver's nil cache: a
+	// concrete type rather than an interface, because there is one
+	// implementation and one consumer.
+	stats *stats.Collector
 
 	// inflight collapses concurrent identical queries into one resolution.
 	//
@@ -155,24 +204,24 @@ type recursor struct {
 
 // ServeDNS resolves one query. It is called from many goroutines at once;
 // resolver.Resolver keeps no state across calls, which is what makes that safe.
-func (rc *recursor) ServeDNS(ctx context.Context, query *wire.Message) *wire.Message {
+func (rc *recursor) ServeDNS(ctx context.Context, query *wire.Message, from netip.Addr) *wire.Message {
+	start := time.Now()
+
 	if query.Header.Opcode != 0 {
 		// UPDATE, NOTIFY and the rest. We are a resolver, and pretending
 		// otherwise by returning success would be worse than saying so.
-		return refuse(query, wire.RcodeNotImp)
+		return rc.record(start, from, wire.Question{}, refuse(query, wire.RcodeNotImp), nil)
 	}
 	if len(query.Questions) != 1 {
 		// RFC 1035 allows QDCOUNT above one and no implementation has ever
 		// agreed on what it would mean.
-		return refuse(query, wire.RcodeFormErr)
+		return rc.record(start, from, wire.Question{}, refuse(query, wire.RcodeFormErr), nil)
 	}
 
 	q := query.Questions[0]
 	if q.Class != wire.ClassIN {
-		return refuse(query, wire.RcodeRefused)
+		return rc.record(start, from, q, refuse(query, wire.RcodeRefused), nil)
 	}
-
-	start := time.Now()
 
 	// Keyed on the folded name, so two clients spelling one name differently
 	// share a walk rather than starting two. The reply each client gets echoes
@@ -188,7 +237,7 @@ func (rc *recursor) ServeDNS(ctx context.Context, query *wire.Message) *wire.Mes
 	})
 	if err != nil {
 		rc.log.Debug("resolution failed", "name", q.Name.String(), "type", q.Type.String(), "err", err)
-		return refuse(query, wire.RcodeServFail)
+		return rc.record(start, from, q, refuse(query, wire.RcodeServFail), nil)
 	}
 	if res.Stale {
 		// Upstream failed and the client is getting an answer that expired.
@@ -204,7 +253,45 @@ func (rc *recursor) ServeDNS(ctx context.Context, query *wire.Message) *wire.Mes
 		"cached", res.CacheHit, "shared", shared,
 		"took", time.Since(start).Round(time.Millisecond).String())
 
-	return rc.reply(query, res)
+	return rc.record(start, from, q, rc.reply(query, res), res)
+}
+
+// record accounts for one answered query and returns the reply unchanged, so
+// that every path out of ServeDNS is counted by wrapping its return rather than
+// by remembering to add a line above it. A refusal is a query too: a client
+// sending malformed messages is exactly what an operator wants to see in the
+// statistics, and leaving those paths out would put the total quietly below the
+// number of packets the server actually answered.
+//
+// res is nil on every path that did not reach a resolution.
+func (rc *recursor) record(start time.Time, from netip.Addr, q wire.Question, reply *wire.Message, res *resolver.Result) *wire.Message {
+	if rc.stats == nil {
+		return reply
+	}
+	e := stats.Event{
+		At:       start,
+		Client:   from,
+		Type:     uint16(q.Type),
+		Rcode:    reply.Header.Rcode,
+		Duration: time.Since(start),
+	}
+	if q.Name != "" {
+		// Folded, so that two clients spelling one name differently are one row
+		// of a top-domains list rather than two.
+		e.Name = q.Name.Fold().String()
+	}
+	if res != nil {
+		// CacheHit here means this client's query was answered from the cache
+		// without asking anyone. It is deliberately not the same quantity the
+		// cache reports at shutdown, which counts every lookup including the
+		// ones a walk makes internally while resolving nameserver addresses.
+		// Two different questions, so two different numbers: this one is how
+		// often a client was spared a walk, and the cache's is how often the
+		// cache was useful to anybody.
+		e.CacheHit, e.Stale = res.CacheHit, res.Stale
+	}
+	rc.stats.Record(e)
+	return reply
 }
 
 // reply turns a resolution into the message the client gets.

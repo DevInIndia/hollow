@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,22 +43,53 @@ const (
 // rejected on its merits rather than silently truncated by the kernel.
 const readBuffer = 4096
 
-// Handler answers one query. It is given the decoded query and returns the
-// message to send back, or nil to send nothing at all.
+// Handler answers one query. It is given the decoded query and the address it
+// came from, and returns the message to send back, or nil to send nothing at
+// all.
 //
 // Returning nil is not the same as returning SERVFAIL. It means this packet
 // deserves no reply, which is the right answer for anything that would turn the
 // server into a participant in someone else's traffic.
+//
+// The client address is a parameter rather than a context value because more
+// than one thing needs it and none of them are optional extras: statistics
+// attribute queries to a client, and per-client rate limiting and access control
+// cannot be written at all without it. A context value would make a required
+// input look like an optional one and would lose its type on the way through.
+//
+// It may be the zero Addr. That is not a client at 0.0.0.0, it means the
+// transport could not report one, and a handler that uses the address for a
+// decision has to say what it does in that case.
 type Handler interface {
-	ServeDNS(ctx context.Context, query *wire.Message) *wire.Message
+	ServeDNS(ctx context.Context, query *wire.Message, from netip.Addr) *wire.Message
 }
 
 // HandlerFunc adapts a function to Handler.
-type HandlerFunc func(context.Context, *wire.Message) *wire.Message
+type HandlerFunc func(context.Context, *wire.Message, netip.Addr) *wire.Message
 
 // ServeDNS calls f.
-func (f HandlerFunc) ServeDNS(ctx context.Context, q *wire.Message) *wire.Message {
-	return f(ctx, q)
+func (f HandlerFunc) ServeDNS(ctx context.Context, q *wire.Message, from netip.Addr) *wire.Message {
+	return f(ctx, q, from)
+}
+
+// clientAddr extracts the address a query came from.
+//
+// The port is dropped: it is a different number on every query from the same
+// client and is of no use to anything that wants to know who is asking. The
+// address is unmapped, so a client reaching a dual-stack listener over IPv4
+// counts as that IPv4 address rather than as a separate ::ffff: client, which
+// would otherwise split one client across two rows of a top-clients list.
+//
+// An address this does not recognise comes back as the zero Addr rather than as
+// a guess.
+func clientAddr(a net.Addr) netip.Addr {
+	switch v := a.(type) {
+	case *net.UDPAddr:
+		return v.AddrPort().Addr().Unmap()
+	case *net.TCPAddr:
+		return v.AddrPort().Addr().Unmap()
+	}
+	return netip.Addr{}
 }
 
 // Server serves DNS on one address, over both transports.
@@ -229,7 +261,7 @@ func (s *Server) Serve(ctx context.Context, c *Conns) error {
 
 // answer decodes a query, hands it to the handler, and encodes the reply.
 // It returns nil when nothing should be sent.
-func (s *Server) answer(ctx context.Context, raw []byte, overTCP bool) []byte {
+func (s *Server) answer(ctx context.Context, raw []byte, from netip.Addr, overTCP bool) []byte {
 	query, err := wire.Unpack(raw)
 	if err != nil {
 		// A message we cannot decode may still have a usable header, and RFC
@@ -251,7 +283,7 @@ func (s *Server) answer(ctx context.Context, raw []byte, overTCP bool) []byte {
 		return nil
 	}
 
-	reply := s.Handler.ServeDNS(ctx, query)
+	reply := s.Handler.ServeDNS(ctx, query, from)
 	if reply == nil {
 		return nil
 	}

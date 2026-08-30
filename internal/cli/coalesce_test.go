@@ -65,7 +65,7 @@ func TestConcurrentIdenticalQueriesResolveOnce(t *testing.T) {
 				Header:    wire.Header{ID: uint16(i + 1), RecursionDesired: true},
 				Questions: []wire.Question{{Name: name, Type: wire.TypeA, Class: wire.ClassIN}},
 			}
-			replies[i] = rc.ServeDNS(context.Background(), query)
+			replies[i] = rc.ServeDNS(context.Background(), query, testClient)
 		}()
 	}
 	wg.Wait()
@@ -136,7 +136,7 @@ func TestDifferentNamesDoNotWaitOnEachOther(t *testing.T) {
 				Header:    wire.Header{ID: uint16(i + 1), RecursionDesired: true},
 				Questions: []wire.Question{{Name: wire.Name(host), Type: wire.TypeA, Class: wire.ClassIN}},
 			}
-			if reply := rc.ServeDNS(context.Background(), query); reply.Header.Rcode != wire.RcodeSuccess {
+			if reply := rc.ServeDNS(context.Background(), query, testClient); reply.Header.Rcode != wire.RcodeSuccess {
 				t.Errorf("%s got rcode %d, want success", host, reply.Header.Rcode)
 			}
 		}()
@@ -178,7 +178,7 @@ func TestCaseVariantsShareOneResolution(t *testing.T) {
 				Header:    wire.Header{ID: uint16(i + 1), RecursionDesired: true},
 				Questions: []wire.Question{{Name: wire.Name(spelling), Type: wire.TypeA, Class: wire.ClassIN}},
 			}
-			reply := rc.ServeDNS(context.Background(), query)
+			reply := rc.ServeDNS(context.Background(), query, testClient)
 			if len(reply.Questions) == 1 {
 				got[i] = reply.Questions[0].Name
 			}

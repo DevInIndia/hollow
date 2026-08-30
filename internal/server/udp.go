@@ -75,7 +75,7 @@ func (s *Server) answerUDP(ctx context.Context, pc net.PacketConn, p packet) {
 	qctx, cancel := s.queryContext(ctx)
 	defer cancel()
 
-	reply := s.answer(qctx, (*p.buf)[:p.n], false)
+	reply := s.answer(qctx, (*p.buf)[:p.n], clientAddr(p.from), false)
 	if reply == nil {
 		return
 	}

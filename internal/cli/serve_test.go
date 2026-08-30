@@ -7,8 +7,10 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/DevInIndia/hollow/internal/resolver"
+	"github.com/DevInIndia/hollow/internal/stats"
 	"github.com/DevInIndia/hollow/internal/wire"
 )
 
@@ -93,7 +95,7 @@ func TestRecursorRefusesWhatItCannotAnswer(t *testing.T) {
 	rc := &recursor{resolver: &resolver.Resolver{}, log: discard()}
 	for label, tc := range tests {
 		t.Run(label, func(t *testing.T) {
-			reply := rc.ServeDNS(context.Background(), tc.query)
+			reply := rc.ServeDNS(context.Background(), tc.query, testClient)
 			if reply == nil {
 				t.Fatal("ServeDNS() = nil, want a reply carrying an rcode")
 			}
@@ -128,7 +130,7 @@ func TestRecursorReportsAFailedResolutionAsServFail(t *testing.T) {
 	}
 
 	rc := &recursor{resolver: &resolver.Resolver{}, log: discard()}
-	reply := rc.ServeDNS(context.Background(), query)
+	reply := rc.ServeDNS(context.Background(), query, testClient)
 	if reply == nil {
 		t.Fatal("ServeDNS() = nil, want SERVFAIL")
 	}
@@ -215,4 +217,109 @@ func TestRecursorReturnsTheWholeCNAMEChain(t *testing.T) {
 
 func discard() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// testClient is the address the handler tests present as the asker. Any valid
+// address will do; what matters is that it is not the zero Addr, since that is
+// the value the server uses to mean it could not tell.
+var testClient = netip.MustParseAddr("192.0.2.10")
+
+// The recursor has to account for every path out of ServeDNS, including the
+// ones that refuse without resolving. A total that counts only the successes
+// sits quietly below the number of packets the server answered, and an operator
+// reading it has no way to tell.
+func TestRecursorRecordsEveryOutcome(t *testing.T) {
+	name, err := wire.ParseName("example.com.")
+	if err != nil {
+		t.Fatalf("parsing: %v", err)
+	}
+	inQuestion := wire.Question{Name: name, Type: wire.TypeA, Class: wire.ClassIN}
+
+	col := stats.New()
+	rc := &recursor{resolver: &resolver.Resolver{}, log: discard(), stats: col}
+
+	// One of each: a bad opcode, a bad question count, a refused class, and a
+	// resolution that fails because the zero Resolver has no root hints.
+	rc.ServeDNS(context.Background(), &wire.Message{
+		Header:    wire.Header{ID: 1, Opcode: 5},
+		Questions: []wire.Question{inQuestion},
+	}, testClient)
+	rc.ServeDNS(context.Background(), &wire.Message{Header: wire.Header{ID: 2}}, testClient)
+	rc.ServeDNS(context.Background(), &wire.Message{
+		Header:    wire.Header{ID: 3},
+		Questions: []wire.Question{{Name: name, Type: wire.TypeA, Class: 3}},
+	}, testClient)
+	rc.ServeDNS(context.Background(), &wire.Message{
+		Header:    wire.Header{ID: 4, RecursionDesired: true},
+		Questions: []wire.Question{inQuestion},
+	}, testClient)
+
+	s := col.Snapshot()
+	if s.QueriesTotal != 4 {
+		t.Errorf("QueriesTotal = %d, want all 4 outcomes counted", s.QueriesTotal)
+	}
+	if s.UpstreamErrors != 1 {
+		t.Errorf("UpstreamErrors = %d, want 1", s.UpstreamErrors)
+	}
+	if len(s.TopClients) != 1 || s.TopClients[0].Name != testClient.String() {
+		t.Errorf("TopClients = %+v, want the one client that asked", s.TopClients)
+	}
+
+	// Two of the four are attributable to a name: the refused class and the
+	// failed resolution. The other two are counted as queries and left out of
+	// the name list, because neither has a name to attribute.
+	//
+	// The bad-opcode message does carry a question section, and it is
+	// deliberately not read. In an UPDATE that section is the zone section and
+	// means something else, so treating it as a queried name would put a name
+	// nobody looked up into the statistics.
+	var named uint64
+	for _, item := range s.TopDomains {
+		named += item.Count
+	}
+	if named != 2 {
+		t.Errorf("the name lists account for %d queries, want 2", named)
+	}
+}
+
+// A nil collector is the handler tests' configuration and must stay inert.
+func TestRecursorWithNoCollectorDoesNotPanic(t *testing.T) {
+	rc := &recursor{resolver: &resolver.Resolver{}, log: discard()}
+	reply := rc.ServeDNS(context.Background(), &wire.Message{Header: wire.Header{ID: 1}}, testClient)
+	if reply == nil {
+		t.Fatal("ServeDNS() = nil")
+	}
+}
+
+// The shutdown report is the only way these numbers are visible before the
+// control socket exists, so it has to say something when nothing happened
+// rather than printing an empty section.
+func TestReportOnAnIdleServer(t *testing.T) {
+	var out strings.Builder
+	report(&out, stats.New().Snapshot())
+	if got := out.String(); !strings.Contains(got, "none") {
+		t.Errorf("report on an idle server printed %q", got)
+	}
+}
+
+func TestReportNamesWhatItCounted(t *testing.T) {
+	col := stats.New()
+	col.Record(stats.Event{
+		At: time.Now(), Client: testClient,
+		Name: "example.com.", Type: 1, Duration: 5 * time.Millisecond,
+	})
+	var out strings.Builder
+	report(&out, col.Snapshot())
+
+	got := out.String()
+	for _, want := range []string{"queries: 1", "latency:", "example.com."} {
+		if !strings.Contains(got, want) {
+			t.Errorf("report is missing %q:\n%s", want, got)
+		}
+	}
+	// The two drop lines are noise when there is nothing to report, and a line
+	// that always reads zero is one an operator learns to skip.
+	if strings.Contains(got, "dropped") {
+		t.Errorf("report mentions drops when there were none:\n%s", got)
+	}
 }

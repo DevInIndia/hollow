@@ -282,7 +282,7 @@ func TestShutdownWaitsForAQueryInFlight(t *testing.T) {
 
 	s := &Server{
 		Log: quiet(),
-		Handler: HandlerFunc(func(qctx context.Context, q *wire.Message) *wire.Message {
+		Handler: HandlerFunc(func(qctx context.Context, q *wire.Message, _ netip.Addr) *wire.Message {
 			close(started)
 			<-finish
 			// The detached context must still be live here. If shutdown had
@@ -402,7 +402,7 @@ func TestUDPDropsWhenTheQueueIsFull(t *testing.T) {
 		Workers: 1,
 		Queue:   1,
 		Log:     quiet(),
-		Handler: HandlerFunc(func(_ context.Context, q *wire.Message) *wire.Message {
+		Handler: HandlerFunc(func(_ context.Context, q *wire.Message, _ netip.Addr) *wire.Message {
 			// Only the first query blocks; the rest run once released, so the
 			// shutdown at the end of the test is not held up.
 			once.Do(func() { <-release })
@@ -497,14 +497,14 @@ func query(t *testing.T, name string, typ wire.Type) *wire.Message {
 
 // answerA is a handler that answers every question with one A record.
 func answerA(addr string) Handler {
-	return HandlerFunc(func(_ context.Context, q *wire.Message) *wire.Message {
+	return HandlerFunc(func(_ context.Context, q *wire.Message, _ netip.Addr) *wire.Message {
 		return replyTo(q, wire.A{Addr: netip.MustParseAddr(addr)})
 	})
 }
 
 // bulky is a handler whose reply does not fit in 512 octets.
 func bulky() Handler {
-	return HandlerFunc(func(_ context.Context, q *wire.Message) *wire.Message {
+	return HandlerFunc(func(_ context.Context, q *wire.Message, _ netip.Addr) *wire.Message {
 		m := replyTo(q)
 		for range 12 {
 			m.Answers = append(m.Answers, wire.RR{
@@ -626,4 +626,59 @@ func isTimeout(err error) bool {
 // and refusals would otherwise print warnings that read as failures.
 func quiet() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// The handler is told who asked, over both transports. Statistics attribute
+// queries to a client with this, and per-client limiting will refuse them with
+// it, so a transport that reported the wrong address or none at all would break
+// both in a way neither could detect.
+func TestHandlerIsToldWhoAsked(t *testing.T) {
+	seen := make(chan netip.Addr, 4)
+	h := HandlerFunc(func(_ context.Context, q *wire.Message, from netip.Addr) *wire.Message {
+		seen <- from
+		return replyTo(q, wire.A{Addr: netip.MustParseAddr("192.0.2.1")})
+	})
+	addr := serve(t, &Server{Handler: h})
+
+	t.Run("udp", func(t *testing.T) {
+		askUDP(t, addr, query(t, "example.com.", wire.TypeA), 512)
+		assertLoopback(t, <-seen)
+	})
+
+	t.Run("tcp", func(t *testing.T) {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("dialing tcp: %v", err)
+		}
+		defer conn.Close()
+		exchangeTCP(t, conn, query(t, "example.com.", wire.TypeA))
+		assertLoopback(t, <-seen)
+	})
+}
+
+func assertLoopback(t *testing.T, got netip.Addr) {
+	t.Helper()
+	if !got.IsValid() {
+		t.Fatal("the handler was given the zero Addr, so it cannot tell who asked")
+	}
+	if !got.IsLoopback() {
+		t.Errorf("the handler was told the client is %v, want a loopback address", got)
+	}
+	// Unmapped, so a client reaching a dual-stack listener over IPv4 is that
+	// IPv4 address rather than a ::ffff: form that would count as a different
+	// client in a top-clients list.
+	if got.Is4In6() {
+		t.Errorf("the client address is %v, want it unmapped", got)
+	}
+}
+
+// An address the transports do not recognise yields the zero Addr rather than a
+// guess, which is what lets a handler tell "nobody told me" from "0.0.0.0".
+func TestClientAddrOnAnUnknownAddressType(t *testing.T) {
+	if got := clientAddr(&net.UnixAddr{Name: "/tmp/x", Net: "unix"}); got.IsValid() {
+		t.Errorf("clientAddr() = %v on a unix address, want the zero Addr", got)
+	}
+	if got := clientAddr(nil); got.IsValid() {
+		t.Errorf("clientAddr(nil) = %v, want the zero Addr", got)
+	}
 }

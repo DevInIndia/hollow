@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 )
@@ -80,6 +81,11 @@ func (s *Server) serveTCP(ctx context.Context, ln net.Listener) error {
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 
+	// Resolved once for the connection rather than once per query. Unlike UDP,
+	// where every packet carries its own source, a stream has one peer for its
+	// whole life and every query on it came from that peer.
+	client := clientAddr(conn.RemoteAddr())
+
 	for {
 		// RFC 7766 expects a connection to carry more than one query, so the
 		// wait between them is an idle timeout rather than a read timeout: a
@@ -112,7 +118,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 			return
 		}
 
-		reply := s.answerTCP(ctx, body)
+		reply := s.answerTCP(ctx, body, client)
 		if reply == nil {
 			// Nothing to say to this one. The connection stays open, since the
 			// next query on it may be perfectly good.
@@ -128,11 +134,11 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	}
 }
 
-func (s *Server) answerTCP(ctx context.Context, body []byte) []byte {
+func (s *Server) answerTCP(ctx context.Context, body []byte, from netip.Addr) []byte {
 	qctx, cancel := s.queryContext(ctx)
 	defer cancel()
 
-	reply := s.answer(qctx, body, true)
+	reply := s.answer(qctx, body, from, true)
 	if reply == nil {
 		return nil
 	}
