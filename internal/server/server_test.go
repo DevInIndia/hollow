@@ -37,9 +37,9 @@ func TestListenBindsBothTransportsOnOnePort(t *testing.T) {
 	}
 }
 
-// The failure CLAUDE.md calls the most dangerous one: TCP unavailable while UDP
-// is free. A server that took the UDP bind and carried on would look healthy and
-// serve one transport.
+// The most dangerous bind failure there is: TCP unavailable while UDP is free.
+// A server that took the UDP bind and carried on would look healthy and serve
+// one transport.
 func TestListenRefusesAPartialBind(t *testing.T) {
 	// Hold the TCP side of a port, leaving its UDP side free.
 	held, err := net.Listen("tcp", "127.0.0.1:0")

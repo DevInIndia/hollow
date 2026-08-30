@@ -2,9 +2,6 @@
 # that honest. Everything here is either build output or not part of the
 # shipped artifact.
 
-# Planning notes, gitignored and not for distribution.
-files/
-
 # Build output. dist/ is four binaries and several megabytes of build context
 # that the image would carry across to the daemon for nothing.
 dist/

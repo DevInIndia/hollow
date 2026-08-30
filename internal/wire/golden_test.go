@@ -154,10 +154,10 @@ func TestGoldenComNSReferral(t *testing.T) {
 	}
 }
 
-// The single highest-value case in the fixture set, called out in TIER1 section
-// 8 as case 9a: a fresh one-octet label followed by a pointer into the middle of
-// a name that was itself reached by an earlier pointer. A resolver that expands
-// only one level of pointer gets this wrong, and it is silent when it does.
+// The single highest-value case in the fixture set: a fresh one-octet label
+// followed by a pointer into the middle of a name that was itself reached by an
+// earlier pointer. A resolver that expands only one level of pointer gets this
+// wrong, and it is silent when it does.
 func TestGoldenSuffixSharingAcrossCompressedName(t *testing.T) {
 	raw := readFixture(t, "com-ns-referral.bin")
 	if !bytes.Contains(raw, []byte{0x01, 0x6a, 0xc0, 0x23}) {

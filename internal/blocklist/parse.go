@@ -54,6 +54,14 @@ type entry struct {
 // is what separates "nothing to add" from "this line was not in any format I
 // know", so that only the second is counted as skipped.
 func parseLine(line string) ([]entry, bool) {
+	// Checked before the comment cut, because element hiding writes its
+	// separator as "##" and the cut would take everything after the first one.
+	if raw := strings.TrimSpace(line); raw != "" && !strings.HasPrefix(raw, "!") {
+		if unsupportedFilter(raw) {
+			return nil, false
+		}
+	}
+
 	line = strip(line)
 	if line == "" {
 		return nil, true
@@ -85,15 +93,78 @@ func parseLine(line string) ([]entry, bool) {
 	return nil, false
 }
 
+// unsupportedFilter reports whether a line is an adblock rule whose meaning
+// this resolver cannot carry out.
+//
+// The comment on parseABP has always said these forms are deliberately not
+// implemented, and that a half-honoured filter rule is worse than one that was
+// visibly skipped. Nothing enforced it. Every one of them reached the
+// domain-only branch instead and became a block rule, which is exactly the
+// outcome that comment describes as the worse one.
+//
+// Two of them blocked a name the list never asked to block. Element hiding lost
+// everything after its first "#" to the hosts-file comment rule, so
+// "example.com##.ad-banner", a rule about a CSS selector, became a block on
+// example.com itself; "#@#" is the exception form of the same syntax, so a rule
+// saying do not hide this also took the domain out. And an option suffix is a
+// condition: "||example.com^$third-party" asks for the domain to be blocked
+// only in third-party context, and applying it without the condition blocks it
+// everywhere. The rest, "@@" exceptions and regular expression rules, produced
+// entries that match nothing, which is harmless but still counted as loaded and
+// still hid from the operator that the exceptions were dropped.
+//
+// Skipping is counted and reported at startup, so a list that is mostly rules
+// hollow cannot honour says so rather than quietly doing something else.
+func unsupportedFilter(line string) bool {
+	// Exception rules. A resolver that cannot express "unblock" must not keep
+	// the half of the rule it does understand.
+	if strings.HasPrefix(line, "@@") {
+		return true
+	}
+
+	// Regular expression rules, "/pattern/".
+	if len(line) > 1 && line[0] == '/' && strings.HasSuffix(line, "/") {
+		return true
+	}
+
+	// Element hiding: "##", "#@#", "#?#", "#$#". The separator is attached to
+	// the domain with no space in front of it, which is what distinguishes it
+	// from the trailing comment a hosts line is allowed to carry.
+	if i := strings.IndexByte(line, '#'); i >= 0 && !strings.ContainsAny(line[:i], " \t") {
+		for _, sep := range []string{"##", "#@#", "#?#", "#$#"} {
+			if strings.HasPrefix(line[i:], sep) {
+				return true
+			}
+		}
+	}
+
+	// Option suffixes are deliberately not here. "||ads.example^$third-party"
+	// keeps being honoured as a block on the domain, which is the decision
+	// TestEveryFormatTheListsActuallyUse records: the modifiers describe request
+	// context a resolver cannot see, and the domain in front of them is an ad
+	// domain either way. Skipping those rules would quietly unblock most of a
+	// real filter list. The cost is named in the README instead.
+
+	return false
+}
+
 // parseABP handles the adblock form, which is "||domain^" and blocks the domain
 // with everything under it.
 //
-// The wider adblock syntax is deliberately not implemented. Element hiding,
-// regular expression rules, the @@ exception form and the option suffixes after
-// $ all mean things a DNS resolver cannot express, and a half-honoured filter
-// rule is worse than one that was visibly skipped. The StevenBlack list contains
-// no adblock lines at all, so this path exists for user-supplied lists rather
-// than for the common case.
+// The wider adblock syntax is mostly not implemented. Element hiding, regular
+// expression rules and the @@ exception form all mean things a DNS resolver
+// cannot express, and a half-honoured filter rule is worse than one that was
+// visibly skipped, so unsupportedFilter turns each of them into a counted skip.
+//
+// The option suffixes after $ are the one exception to that rule, and they are
+// honoured rather than skipped. "||ads.example^$third-party" names an ad domain
+// and then qualifies it by a request context no resolver can observe; dropping
+// the rule would unblock the domain, and most of a real filter list with it.
+// The qualifier is lost, so the block is broader than the rule asked for, which
+// is a real cost and is named in the README rather than hidden here.
+//
+// The StevenBlack list contains no adblock lines at all, so this path exists for
+// user-supplied lists rather than for the common case.
 func parseABP(rest string) ([]entry, bool) {
 	name, _, ok := strings.Cut(rest, "^")
 	if !ok {

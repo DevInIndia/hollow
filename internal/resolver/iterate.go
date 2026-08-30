@@ -639,10 +639,11 @@ func (s *session) trace(st Step) {
 
 // candidates copies the servers and shuffles the copy.
 //
-// Shuffling matters more than it looks: TIER1 measured k-root at 15 ms and
-// a-root at 221 ms from this machine. Always starting at the head of a fixed
-// list would pay the worst case on every cold resolution, and would also send
-// every resolver that copied the same list to the same server.
+// Shuffling matters more than it looks: measured from the machine this was
+// written on, k-root answered in 15 ms and a-root in 221 ms. Always starting at
+// the head of a fixed list would pay the worst case on every cold resolution,
+// and would also send every resolver that copied the same list to the same
+// server.
 func (r *Resolver) candidates(in []netip.AddrPort) []netip.AddrPort {
 	out := make([]netip.AddrPort, len(in))
 	copy(out, in)

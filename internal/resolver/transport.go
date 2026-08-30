@@ -263,10 +263,10 @@ func (t *Transport) overUDP(ctx context.Context, server netip.AddrPort, query []
 	// drop datagrams from any other address and port, which is a filter no
 	// amount of checking in this process can match for cost. The source port is
 	// left to the operating system, which randomises it on all three target
-	// platforms per RFC 6056. TIER1 section 3 asks for crypto/rand there too,
-	// but binding a chosen port means competing with every other socket on the
-	// machine and retrying on collision, for no gain over what the kernel
-	// already does.
+	// platforms per RFC 6056. Randomising it here with crypto/rand instead was
+	// considered and rejected: binding a chosen port means competing with every
+	// other socket on the machine and retrying on collision, for no gain over
+	// what the kernel already does.
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "udp", server.String())
 	if err != nil {

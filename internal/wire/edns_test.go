@@ -179,8 +179,7 @@ func TestEDNSRejects(t *testing.T) {
 	}
 }
 
-// Case 18 of the TIER1 matrix: an option whose declared length does not match
-// the octets present.
+// An option whose declared length does not match the octets present.
 func TestOPTRejectsMalformedOptionLength(t *testing.T) {
 	tests := []struct {
 		name  string

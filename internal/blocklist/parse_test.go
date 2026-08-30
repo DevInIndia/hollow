@@ -228,3 +228,77 @@ func TestAnAbsurdlyLongLineIsOneSkipAndNotTheEndOfTheFile(t *testing.T) {
 		t.Errorf("skipped = %d, want 1", skipped)
 	}
 }
+
+// TestAdblockFormsHollowCannotHonourAreSkippedNotGuessedAt is the regression
+// test for the failure the parseABP comment described and did not prevent.
+//
+// Each of these lines used to reach the domain-only branch and become a block
+// rule. The two marked below did it to a real name: a cosmetic filter and its
+// exception both took example.com out of service, because the hosts-file
+// comment rule cut the line at the first "#" of the "##" separator.
+//
+// Rules carrying $ options are deliberately absent from this list. They are
+// honoured, not skipped, which TestEveryFormatTheListsActuallyUse pins down.
+func TestAdblockFormsHollowCannotHonourAreSkippedNotGuessedAt(t *testing.T) {
+	for _, line := range []string{
+		"@@allowed.example",
+		"@@||allowed.example^",
+		"example.com##.ad-banner",  // blocked example.com
+		"example.com#@#.sponsored", // blocked example.com
+		"example.com#?#div:has(a)",
+		"example.com#$#body { x: y }",
+		`/ads[0-9]+\.example/`,
+	} {
+		t.Run(line, func(t *testing.T) {
+			if got, ok := parseLine(line); ok {
+				t.Fatalf("parseLine(%q) = %v, understood; it must be skipped so the count reports it", line, got)
+			}
+		})
+	}
+}
+
+// TestTheRulesNextToThemStillLoad guards the fix from being a blanket refusal
+// of anything with a punctuation mark in it.
+func TestTheRulesNextToThemStillLoad(t *testing.T) {
+	tests := []struct {
+		line string
+		want []entry
+	}{
+		{"||ads.example^", []entry{{name: "ads.example.", wildcard: true}}},
+		{"0.0.0.0 ads.example # trailing note", []entry{{name: "ads.example."}}},
+		{"0.0.0.0 ads.example ## doubled in a comment", []entry{{name: "ads.example."}}},
+		{"ads.example", []entry{{name: "ads.example."}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.line, func(t *testing.T) {
+			got, ok := parseLine(tt.line)
+			if !ok {
+				t.Fatalf("parseLine(%q) reported the line not understood", tt.line)
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("parseLine(%q) = %v, want %v", tt.line, got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("entry %d = %v, want %v", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestACosmeticFilterDoesNotTakeTheDomainOut states the bug in the terms an
+// operator would have hit it in: a list carrying element-hiding rules must not
+// stop the sites those rules decorate from resolving.
+func TestACosmeticFilterDoesNotTakeTheDomainOut(t *testing.T) {
+	l := parse(t, "example.com##.ad-banner\n||ads.example^\n", "")
+	if l.Blocked(name(t, "example.com.")) {
+		t.Error("a cosmetic filter for example.com blocked example.com itself")
+	}
+	if !l.Blocked(name(t, "ads.example.")) {
+		t.Error("the real rule beside it stopped working")
+	}
+	if _, _, _, skipped := l.Counts(); skipped != 1 {
+		t.Errorf("skipped = %d, want 1: the line hollow could not honour must be counted", skipped)
+	}
+}

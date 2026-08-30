@@ -1,7 +1,3 @@
-# Planning notes. These are working documents, not part of the shipped artifact.
-# Anchored, so a nested directory named files/ is not swallowed by this rule.
-/files/
-
 # Build output. Anchored so that cmd/hollow/ is still tracked.
 /hollow
 /hollow.exe

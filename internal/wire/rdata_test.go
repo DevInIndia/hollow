@@ -104,8 +104,8 @@ func TestRDataRoundTrip(t *testing.T) {
 	}
 }
 
-// Cases 12 to 17 of the TIER1 matrix. Every one is a record whose rdata and
-// RDLENGTH disagree, which the exact-boundary check is there to catch.
+// Every case here is a record whose rdata and RDLENGTH disagree, which the
+// exact-boundary check is there to catch.
 func TestRDataRejects(t *testing.T) {
 	tests := []struct {
 		name  string
