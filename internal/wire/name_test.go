@@ -365,3 +365,86 @@ func TestWithinRejectsUnparsableNames(t *testing.T) {
 		t.Error("a name was reported as within an unparsable zone")
 	}
 }
+
+func TestSuffixesWalksLabelsNotBytes(t *testing.T) {
+	tests := map[string]struct {
+		in   Name
+		want []Name
+	}{
+		"a name and its parents": {
+			in:   "a.b.example.com.",
+			want: []Name{"a.b.example.com.", "b.example.com.", "example.com.", "com."},
+		},
+		"a single label": {
+			in:   "com.",
+			want: []Name{"com."},
+		},
+		// The reason this method exists. An escaped dot is data inside one
+		// label, so this name is a sibling of com and not a child of it, and a
+		// blocklist walking it must never be offered "com." as a suffix.
+		"an escaped dot stays inside its label": {
+			in:   `evil\.com.`,
+			want: []Name{`evil\.com.`},
+		},
+		"an escaped dot part way down": {
+			in:   `www.evil\.com.`,
+			want: []Name{`www.evil\.com.`, `evil\.com.`},
+		},
+		// The root has no parents and is not offered as one, or every walk
+		// would end at a suffix that matches everything.
+		"the root":             {in: Root, want: nil},
+		"the empty name":       {in: "", want: nil},
+		"an unparsable escape": {in: `bad\`, want: nil},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			got := tc.in.Suffixes()
+			if len(got) != len(tc.want) {
+				t.Fatalf("Suffixes() = %q, want %q", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("Suffixes()[%d] = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// Every suffix has to be a name in its own right, or the caller cannot compare
+// it against anything ParseName produced.
+func TestSuffixesAreThemselvesNames(t *testing.T) {
+	for _, s := range Name("a.b.example.com.").Suffixes() {
+		got, err := ParseName(string(s))
+		if err != nil {
+			t.Errorf("ParseName(%q): %v", s, err)
+			continue
+		}
+		if got != s {
+			t.Errorf("ParseName(%q) = %q, want the suffix unchanged", s, got)
+		}
+	}
+}
+
+func TestFoldKeysWithoutTouchingTheWireForm(t *testing.T) {
+	const mixed Name = "A.Root-Servers.NET."
+	if got, want := mixed.Fold(), Name("a.root-servers.net."); got != want {
+		t.Errorf("Fold() = %q, want %q", got, want)
+	}
+	if mixed != "A.Root-Servers.NET." {
+		t.Error("Fold() mutated the receiver")
+	}
+
+	// Two spellings of one name must land on one key, which is the whole
+	// purpose: otherwise glue filed under one spelling is lost to the other.
+	if Name("NS1.EXAMPLE.COM.").Fold() != Name("ns1.example.com.").Fold() {
+		t.Error("two spellings of one name folded to different keys")
+	}
+
+	// An escaped octet is a digit sequence, so folding must leave it alone
+	// rather than rewriting the escape itself.
+	if got, want := Name(`\255.EXAMPLE.`).Fold(), Name(`\255.example.`); got != want {
+		t.Errorf("Fold() = %q, want %q", got, want)
+	}
+}

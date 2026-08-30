@@ -34,6 +34,60 @@ func (n Name) EqualFold(other Name) bool {
 	return strings.EqualFold(string(n), string(other))
 }
 
+// Fold returns n lowercased, for use as a map key where DNS case-insensitive
+// matching is wanted but a comparison per candidate is too slow.
+//
+// The result is a key and nothing else. It must never be stored in a record or
+// written to the wire, because the 0x20 defence depends on the case that
+// arrived surviving intact.
+//
+// Lowercasing the presentation string is sound because that string is always
+// printable ASCII: appendEscaped escapes every octet outside '!' to '~', so
+// there is no multi-byte sequence for strings.ToLower to fold differently from
+// the ASCII rule RFC 4343 specifies. Escaped octets are unaffected for the same
+// reason, since a letter is printable and therefore never escaped in the first
+// place.
+func (n Name) Fold() Name { return Name(strings.ToLower(string(n))) }
+
+// Suffixes returns n followed by each of its parent names, from the name itself
+// down to its final label. The root is not included, and neither the root nor a
+// name that fails to parse yields anything.
+//
+// For "a.b.example.com." the result is "a.b.example.com.", "b.example.com.",
+// "example.com.", "com.". Each is a slice of n's own storage, so the walk
+// allocates once for the slice and never for the names.
+//
+// This exists because a suffix match over the raw string is wrong in the way
+// that matters. Dots inside a label are escaped, so "evil\.com." is a single
+// label whose bytes end in "com." and which must not be treated as living under
+// com. Splitting on unescaped dots only, it yields itself and nothing else.
+func (n Name) Suffixes() []Name {
+	if n == "" || n == Root {
+		return nil
+	}
+	s := string(n)
+	out := []Name{n}
+	for i := 0; i < len(s); {
+		switch c := s[i]; {
+		case c == '\\':
+			_, w, err := unescape(s[i:])
+			if err != nil {
+				return nil
+			}
+			i += w
+		case c == '.':
+			// The dot that ends the last label terminates the name rather
+			// than opening a parent, which is what keeps the root out.
+			if i++; i < len(s) {
+				out = append(out, Name(s[i:]))
+			}
+		default:
+			i++
+		}
+	}
+	return out
+}
+
 // Within reports whether n lies inside zone, either equal to it or below it.
 // Every name is within the root.
 //

@@ -115,7 +115,7 @@ func Parse(r io.Reader) ([]Server, error) {
 		// Names in a hints file are not consistently cased, and DNS names
 		// compare case-insensitively per RFC 4343, so fold before keying or
 		// A.ROOT-SERVERS.NET and a.root-servers.net become two servers.
-		key := wire.Name(strings.ToLower(string(owner)))
+		key := owner.Fold()
 		s := byName[key]
 		if s == nil {
 			s = &Server{Name: key}

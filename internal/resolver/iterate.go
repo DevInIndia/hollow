@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/netip"
-	"strings"
 
 	"github.com/DevInIndia/hollow/internal/wire"
 )
@@ -142,7 +141,7 @@ func (r *Resolver) Resolve(ctx context.Context, q wire.Question) (*Result, error
 	// Names already visited in this chain. A CNAME pointing back at one of them
 	// is a loop, and a loop that the hop count alone would take eight queries
 	// to notice.
-	seen := map[wire.Name]bool{fold(q.Name): true}
+	seen := map[wire.Name]bool{q.Name.Fold(): true}
 	var chain []wire.RR
 
 	cur := q
@@ -170,10 +169,10 @@ func (r *Resolver) Resolve(ctx context.Context, q wire.Question) (*Result, error
 		// These links came from a message that is about to be discarded, so
 		// this is the only record of them.
 		chain = append(chain, links...)
-		if seen[fold(end)] {
+		if seen[end.Fold()] {
 			return nil, fmt.Errorf("resolver: resolving %q: %w", q.Name, ErrCNAMELoop)
 		}
-		seen[fold(end)] = true
+		seen[end.Fold()] = true
 		cur.Name = end
 	}
 }
@@ -352,13 +351,13 @@ func (s *session) delegation(ctx context.Context, msg *wire.Message, zone wire.N
 		if !rr.Name.Within(zone) {
 			continue
 		}
-		glue[fold(rr.Name)] = append(glue[fold(rr.Name)], addr)
+		glue[rr.Name.Fold()] = append(glue[rr.Name.Fold()], addr)
 	}
 
 	var missing []wire.Name
 	var v4, v6 []netip.AddrPort
 	for _, host := range hosts {
-		addrs := glue[fold(host)]
+		addrs := glue[host.Fold()]
 		if len(addrs) == 0 {
 			missing = append(missing, host)
 			continue
@@ -376,12 +375,12 @@ func (s *session) delegation(ctx context.Context, msg *wire.Message, zone wire.N
 			// finding it would mean asking it. That is what glue is for, and
 			// its absence means the delegation is broken, not that there is
 			// something to chase.
-			if host.Within(child) || s.resolving[fold(host)] {
+			if host.Within(child) || s.resolving[host.Fold()] {
 				continue
 			}
-			s.resolving[fold(host)] = true
+			s.resolving[host.Fold()] = true
 			addrs, err := s.addresses(ctx, host)
-			delete(s.resolving, fold(host))
+			delete(s.resolving, host.Fold())
 			if err != nil {
 				if ctx.Err() != nil {
 					return nil, "", err
@@ -462,11 +461,6 @@ func split(addrs []netip.Addr, port uint16, v4, v6 []netip.AddrPort) ([]netip.Ad
 	}
 	return v4, v6
 }
-
-// fold lowercases a name for use as a map key. Names match case-insensitively
-// per RFC 4343, so keying on the wire spelling would file NS1.EXAMPLE.COM and
-// ns1.example.com separately and lose the glue for one of them.
-func fold(n wire.Name) wire.Name { return wire.Name(strings.ToLower(string(n))) }
 
 func (s *session) trace(st Step) {
 	if s.r.Trace != nil {
