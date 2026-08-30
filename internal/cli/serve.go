@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/DevInIndia/hollow/internal/cache"
 	"github.com/DevInIndia/hollow/internal/resolver"
 	"github.com/DevInIndia/hollow/internal/server"
 	"github.com/DevInIndia/hollow/internal/wire"
@@ -34,6 +35,8 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 		workers = fs.Int("workers", server.DefaultWorkers, "size of the UDP worker pool")
 		hints   = fs.String("hints", "", "root hints in named.root format; default is the compiled-in list")
 		verbose = fs.Bool("verbose", false, "log every query answered")
+		size    = fs.Int("cache-size", cache.DefaultEntries, "answers to hold in the cache; 0 disables caching")
+		stale   = fs.Duration("serve-stale", 0, "how long past expiry an answer may still be served when resolution fails; 0 disables")
 	)
 	fs.Usage = func() {
 		fmt.Fprint(stderr, "usage: hollow serve [flags]\n\nflags:\n")
@@ -50,6 +53,17 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "hollow: --workers %d, want at least one\n", *workers)
 		return ExitFailure
 	}
+	if *size < 0 {
+		fmt.Fprintf(stderr, "hollow: --cache-size %d, want zero or more\n", *size)
+		return ExitFailure
+	}
+	if *stale > 0 && *size == 0 {
+		// Serving stale answers out of a cache that holds none is not a
+		// configuration with a sensible reading, and silently ignoring one of
+		// two flags the operator set is worse than refusing both.
+		fmt.Fprintln(stderr, "hollow: --serve-stale needs a cache, but --cache-size is 0")
+		return ExitFailure
+	}
 
 	level := slog.LevelInfo
 	if *verbose {
@@ -64,6 +78,14 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "hollow: %v\n", err)
 		return ExitFailure
+	}
+
+	// One cache for the whole process, hanging off the shared resolver, so that
+	// what one client's query learned is there for the next client's. A cache
+	// per worker would divide the hit rate by the size of the pool and hold
+	// sixty-four copies of the same answers.
+	if *size > 0 {
+		r.Cache = cache.New(cache.Config{Entries: *size, StaleFor: *stale})
 	}
 
 	s := &server.Server{
@@ -85,9 +107,26 @@ func Serve(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 
 	fmt.Fprintf(stdout, "hollow listening on %s, udp and tcp\n", conns.Addr())
+	switch {
+	case r.Cache == nil:
+		fmt.Fprintln(stdout, "cache disabled, every query walks from the root")
+	case *stale > 0:
+		fmt.Fprintf(stdout, "cache holding %d answers, serving stale for up to %v\n", *size, *stale)
+	default:
+		fmt.Fprintf(stdout, "cache holding %d answers\n", *size)
+	}
+
 	if err := s.Serve(ctx, conns); err != nil {
 		fmt.Fprintf(stderr, "hollow: %v\n", err)
 		return ExitFailure
+	}
+	if r.Cache != nil {
+		// Reported at the end for the same reason the server reports dropped
+		// packets there: a number nobody can see is a number nobody checks, and
+		// the hit rate is the whole claim this feature is making.
+		st := r.Cache.Stats()
+		fmt.Fprintf(stdout, "cache: %d hits, %d misses, %d served stale, %d entries, %d evicted\n",
+			st.Hits, st.Misses, st.Stale, st.Entries, st.Evictions)
 	}
 	fmt.Fprintln(stdout, "hollow stopped")
 	return ExitOK
@@ -124,9 +163,18 @@ func (rc *recursor) ServeDNS(ctx context.Context, query *wire.Message) *wire.Mes
 		rc.log.Debug("resolution failed", "name", q.Name.String(), "type", q.Type.String(), "err", err)
 		return refuse(query, wire.RcodeServFail)
 	}
+	if res.Stale {
+		// Upstream failed and the client is getting an answer that expired.
+		// That is a deliberate trade and not a detail to bury at debug level:
+		// the answer may be wrong, and the operator is the one who can find out
+		// why resolution is failing.
+		rc.log.Warn("served a stale answer, resolution failed",
+			"name", q.Name.String(), "type", q.Type.String())
+	}
 	rc.log.Debug("answered",
 		"name", q.Name.String(), "type", q.Type.String(),
 		"rcode", res.Reply.Msg.Header.Rcode, "queries", res.Queries,
+		"cached", res.CacheHit,
 		"took", time.Since(start).Round(time.Millisecond).String())
 
 	return rc.reply(query, res)

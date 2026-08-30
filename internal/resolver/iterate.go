@@ -7,8 +7,15 @@ import (
 	"math/rand/v2"
 	"net/netip"
 
+	"github.com/DevInIndia/hollow/internal/cache"
 	"github.com/DevInIndia/hollow/internal/wire"
 )
+
+// ProtocolCache is the Reply.Protocol of an answer that came from the cache
+// rather than from a server. It is not a transport, and it is reported as one
+// so that every consumer which already renders the protocol says where the
+// answer came from without being taught about caching.
+const ProtocolCache = "cache"
 
 // Failures that end a resolution rather than one exchange within it. Transport
 // errors from Exchange are not among these: a single server refusing to answer
@@ -87,8 +94,21 @@ type Result struct {
 	CNAMEs []wire.RR
 
 	// Queries is how many exchanges the whole resolution cost, including any
-	// spent resolving nameserver names that had no glue.
+	// spent resolving nameserver names that had no glue. A resolution answered
+	// entirely from the cache costs zero, which is the point of the cache and
+	// is worth being able to see.
 	Queries int
+
+	// CacheHit reports that Reply came from the cache rather than from a
+	// server. A resolution that only shortened its walk with a cached
+	// delegation is not a hit: it still asked someone.
+	CacheHit bool
+
+	// Stale reports that Reply is an expired answer served because resolution
+	// failed, RFC 8767. It implies CacheHit. Anything presenting this result to
+	// a user should say so, because the answer may be wrong in a way a fresh
+	// failure would not have been.
+	Stale bool
 }
 
 // Resolver walks the delegation chain from the root, asking one server at a
@@ -119,6 +139,16 @@ type Resolver struct {
 	// Shuffle permutes the candidate servers for one step. Nil means
 	// math/rand/v2.Shuffle. Tests replace it to make an order deterministic.
 	Shuffle func(n int, swap func(i, j int))
+
+	// Cache, when set, holds answers and delegations between resolutions. Nil
+	// disables caching entirely, which is the right setting for a single
+	// resolution in a process that is about to exit, and is what keeps a cache
+	// bug from being able to masquerade as a working resolver in these tests.
+	//
+	// It is a concrete type rather than an interface because there is one
+	// implementation and one consumer. An interface here would be a seam put in
+	// for a second caller that does not exist.
+	Cache *cache.Cache
 
 	// Trace, when set, is called once per exchange. It must not block.
 	Trace func(Step)
@@ -151,7 +181,7 @@ func (r *Resolver) Resolve(ctx context.Context, q wire.Question) (*Result, error
 		}
 		rep, err := s.iterate(ctx, cur)
 		if err != nil {
-			return nil, err
+			return s.staleOr(ctx, q, err)
 		}
 
 		end, links, found := chase(rep.Msg, cur.Name, cur.Type)
@@ -163,7 +193,12 @@ func (r *Resolver) Resolve(ctx context.Context, q wire.Question) (*Result, error
 		// carried are already in its own answer section, so adding them to the
 		// chain would report them twice to a caller that renders both.
 		if found || len(links) == 0 || cur.Type == wire.TypeCNAME {
-			return &Result{Reply: rep, CNAMEs: chain, Queries: s.queries}, nil
+			return &Result{
+				Reply:    rep,
+				CNAMEs:   chain,
+				Queries:  s.queries,
+				CacheHit: rep.Protocol == ProtocolCache,
+			}, nil
 		}
 
 		// These links came from a message that is about to be discarded, so
@@ -194,27 +229,134 @@ type session struct {
 	resolving map[wire.Name]bool
 }
 
-// iterate walks delegations for one question until something that is not a
-// referral comes back.
+// iterate answers one question, from the cache if it can and by walking
+// delegations if it cannot.
+//
+// The cache is consulted here rather than in Resolve so that the nested
+// resolutions started by addresses, which are a large share of the repeat work
+// in a cold walk, get the benefit too.
 func (s *session) iterate(ctx context.Context, q wire.Question) (*Reply, error) {
-	zone := wire.Root
-	servers := s.r.candidates(s.r.Hints)
+	if s.r.Cache != nil {
+		if msg, ok := s.r.Cache.Answer(q); ok {
+			rep := &Reply{Msg: msg, Protocol: ProtocolCache}
+			// Traced with a zero Server, because nobody was asked. A trace that
+			// invented an address here would be describing a packet that was
+			// never sent.
+			s.trace(Step{Zone: wire.Root, Query: q, Kind: classify(msg, q), Reply: rep})
+			return rep, nil
+		}
+	}
 
+	zone, servers, shortcut := s.start(q)
+	rep, err := s.walk(ctx, zone, servers, q)
+
+	// A cached delegation is a claim about where a zone lives, and zones move.
+	// If the walk from one fails, the shortcut is the first thing to suspect,
+	// so the second attempt starts where a cold resolver would have. Without
+	// this a single stale cut turns into a hard failure for an entire subtree,
+	// which is a cache making the resolver worse than no cache at all.
+	//
+	// It cannot loop: the retry starts at the root, and the shared query budget
+	// bounds both attempts together.
+	if err != nil && shortcut && ctx.Err() == nil {
+		rep, err = s.walk(ctx, wire.Root, s.r.candidates(s.r.Hints), q)
+	}
+	return rep, err
+}
+
+// start picks where to begin the walk: the deepest cached zone cut enclosing
+// the name, or the root. The bool reports which, because the caller treats a
+// failure from a shortcut differently from a failure from the root.
+//
+// This is the half of caching that distinguishes names rather than repeats.
+// Answers alone still send every unseen host under a zone through root and com;
+// a remembered cut starts the second one at the zone.
+func (s *session) start(q wire.Question) (wire.Name, []netip.AddrPort, bool) {
+	if s.r.Cache != nil {
+		if zone, servers, ok := s.r.Cache.Delegation(q.Name); ok {
+			return zone, s.r.candidates(servers), true
+		}
+	}
+	return wire.Root, s.r.candidates(s.r.Hints), false
+}
+
+// walk follows delegations from one starting point until something that is not
+// a referral comes back.
+func (s *session) walk(ctx context.Context, zone wire.Name, servers []netip.AddrPort, q wire.Question) (*Reply, error) {
 	for depth := 0; depth <= s.r.maxDepth(); depth++ {
 		rep, err := s.ask(ctx, servers, zone, q)
 		if err != nil {
 			return nil, err
 		}
 		if classify(rep.Msg, q) != KindReferral {
+			if s.r.Cache != nil {
+				s.r.Cache.StoreAnswer(q, rep.Msg)
+			}
 			return rep, nil
 		}
 		next, child, err := s.delegation(ctx, rep.Msg, zone, q, rep.Server)
 		if err != nil {
 			return nil, err
 		}
+		if s.r.Cache != nil {
+			// Stored here, at the only point where the referral has been
+			// checked for bailiwick and has not yet been discarded. What goes
+			// in is what delegation returned, never the referral's own
+			// contents, because the checks that made it safe ran on the way
+			// through this function and do not run again on the way out of the
+			// cache.
+			s.r.Cache.StoreDelegation(child, next, referralTTL(rep.Msg, child))
+		}
 		zone, servers = child, next
 	}
 	return nil, fmt.Errorf("resolver: resolving %q: %d delegations deep: %w", q.Name, s.r.maxDepth(), ErrResolutionLimit)
+}
+
+// referralTTL is the shortest TTL among the NS records delegating zone, or zero
+// if there is none worth believing.
+//
+// The NS RRset is what the parent published about where the zone lives, so it
+// is the parent's own statement of how long that is true for. Zero is returned
+// rather than a default because StoreDelegation refuses it, which is the
+// correct outcome: a delegation nobody attached a lifetime to is one to walk
+// again rather than one to guess about.
+func referralTTL(msg *wire.Message, zone wire.Name) uint32 {
+	var ttl uint32
+	for _, rr := range msg.Authority {
+		if rr.Type != wire.TypeNS || rr.TTL <= 0 || !rr.Name.EqualFold(zone) {
+			continue
+		}
+		if ttl == 0 || uint32(rr.TTL) < ttl {
+			ttl = uint32(rr.TTL)
+		}
+	}
+	return ttl
+}
+
+// staleOr answers a failed resolution from an expired cache entry, RFC 8767,
+// and otherwise returns the failure unchanged.
+//
+// The question is the one the caller asked, not whatever name a CNAME chain had
+// reached when the walk broke down: an expired answer to a question nobody
+// asked is not an answer.
+//
+// A cancelled context is excluded because it is not a resolution failure. The
+// caller has left, and handing back a stale answer would report success for
+// work that was abandoned.
+func (s *session) staleOr(ctx context.Context, q wire.Question, err error) (*Result, error) {
+	if s.r.Cache == nil || ctx.Err() != nil {
+		return nil, err
+	}
+	msg, ok := s.r.Cache.Stale(q)
+	if !ok {
+		return nil, err
+	}
+	return &Result{
+		Reply:    &Reply{Msg: msg, Protocol: ProtocolCache},
+		Queries:  s.queries,
+		CacheHit: true,
+		Stale:    true,
+	}, nil
 }
 
 // ask puts one question to each server in turn and returns the first usable

@@ -74,7 +74,9 @@ type Reply struct {
 	// Server is the address that answered.
 	Server netip.AddrPort
 
-	// Protocol is "udp" or "tcp", as passed to net.Dial.
+	// Protocol is "udp" or "tcp", as passed to net.Dial, or ProtocolCache for a
+	// reply that came from the cache and was never on a wire. Server, Size and
+	// RTT are all zero in that case, because none of them happened.
 	Protocol string
 
 	// Size is the length in octets of the message as it arrived, excluding the

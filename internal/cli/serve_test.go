@@ -27,6 +27,13 @@ func TestServeRejectsBadArguments(t *testing.T) {
 		// An address that cannot be bound is reported rather than retried
 		// somewhere else.
 		"unbindable address": {"--addr", "203.0.113.1:15353"},
+
+		"negative cache size": {"--cache-size", "-1"},
+
+		// Two flags that contradict each other. Honouring one and dropping the
+		// other silently would leave the operator believing they had asked for
+		// something they did not get.
+		"stale without a cache": {"--cache-size", "0", "--serve-stale", "1h"},
 	}
 
 	for name, args := range tests {
