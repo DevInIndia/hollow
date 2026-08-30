@@ -258,6 +258,8 @@ make release     # four platforms into dist/ with SHA256SUMS
 
 MIT. See [LICENSE](LICENSE).
 
+Built by [Shashank Chauhan](https://www.linkedin.com/in/shashank-chauhan-b492a1311).
+
 <details>
 <summary><b>Hackathon submission notes</b></summary>
 
