@@ -88,14 +88,38 @@ $ hollow inspect example.com
 
 ## Install
 
-Download a binary for your platform from [Releases](../../releases), or:
+**Linux and macOS**
 
 ```bash
-go build ./cmd/hollow                                  # from source
+curl -fsSL https://raw.githubusercontent.com/DevInIndia/hollow/main/install.sh | sh
+```
+
+**Windows**, in PowerShell
+
+```powershell
+irm https://raw.githubusercontent.com/DevInIndia/hollow/main/install.ps1 | iex
+```
+
+The installer picks the binary for your platform, verifies it against the `SHA256SUMS` published with the release, and installs to `~/.local/bin` (`%LOCALAPPDATA%\hollow\bin` on Windows). A checksum mismatch installs nothing, and nothing runs as root. Set `HOLLOW_INSTALL_DIR` to change where it lands, or `HOLLOW_VERSION=v1.0.1` to pin a release.
+
+Piping a script into a shell is worth being wary of, so read it first if you prefer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DevInIndia/hollow/main/install.sh -o install.sh
+less install.sh && sh install.sh
+```
+
+**Other ways**
+
+```bash
+go install github.com/DevInIndia/hollow/cmd/hollow@latest   # if you have Go
+go build ./cmd/hollow                                       # from source
 docker build -t hollow . && docker run --rm -p 15353:15353/udp hollow
 ```
 
-Runs on Linux, macOS and Windows, amd64 and arm64. Statically linked, `CGO_ENABLED=0`, no libc.
+Or take a binary straight from [Releases](../../releases).
+
+Prebuilt binaries cover linux/amd64, linux/arm64, darwin/arm64 and windows/amd64. Intel Macs and anything else build from source. Statically linked, `CGO_ENABLED=0`, no libc.
 
 ## Usage
 
