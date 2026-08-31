@@ -7,9 +7,12 @@
 Walks the root servers itself. Filters ads. Shows its work.
 One static binary, four platforms, and an empty `go.mod`.
 
+🌐 **[Live Documentation & Interactive Guide: https://hollow-site.vercel.app/](https://hollow-site.vercel.app/)**
+
 `0 dependencies` · `0 go.sum` · `0 vendor/` · `342 tests` · `86% covered` · `reproducible builds`
 
 </div>
+
 
 ---
 
